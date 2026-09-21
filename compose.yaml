@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+#   docker compose up -d
+
+services:
+  hho:
+    image: ghcr.io/ankek/hho:0.1.0
+    container_name: hho
+    restart: unless-stopped
+
+    ports:
+      - '${HHO_PORT:-7745}:7745'
+
+    volumes:
+      #   mkdir -p ./data && sudo chown -R 65532:65532 ./data
+      #
+      # - ./data:/data
+
+    environment:
+      # HHO_DATA_DIR: /data
+      # HHO_ADDR: ':7745'
+      # HHO_TRUST_PROXY_HEADERS: 'false'
+      # HHO_MAX_ATTACHMENT_SIZE_BYTES: '26214400'
+      # HHO_ATTACHMENT_RECLAIM_INTERVAL_SECONDS: '3600'
+      # HHO_MIN_CLIENT_VERSION: ''
+      # HHO_BACKUP_INTERVAL_SECONDS: '86400'
+      # HHO_BACKUP_RETENTION_COUNT: '7'
+      {}
+
+    healthcheck:
+      test: ['CMD', '/usr/local/bin/hho', 'healthcheck']
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+    read_only: true
+
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  hho-data:
