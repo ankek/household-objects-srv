@@ -1,0 +1,43 @@
+{
+  "name": "hho-web",
+  "version": "0.0.0",
+  "private": true,
+  "description": "HHO web UI — Vue 3 SPA built by Vite and embedded into the Go binary via embed.FS (FR-100).",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest",
+    "typecheck": "vue-tsc --build",
+    "lint": "eslint . && prettier --check .",
+    "format": "prettier --write ."
+  },
+  "dependencies": {
+    "pinia": "4.0.3",
+    "vue": "3.5.41",
+    "vue-router": "5.2.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "24.13.3",
+    "@vitejs/plugin-vue": "6.0.8",
+    "@vue/eslint-config-prettier": "10.2.0",
+    "@vue/eslint-config-typescript": "14.9.0",
+    "@vue/test-utils": "2.4.11",
+    "@vue/tsconfig": "0.9.1",
+    "eslint": "10.9.1",
+    "eslint-plugin-vue": "10.10.0",
+    "happy-dom": "20.11.6",
+    "jiti": "2.7.0",
+    "prettier": "3.9.6",
+    "typescript": "5.9.3",
+    "vite": "8.2.2",
+    "vitest": "4.1.11",
+    "vue-tsc": "3.3.11"
+  }
+}
