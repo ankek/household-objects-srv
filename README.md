@@ -14,7 +14,7 @@ HHO ships as two coupled products :
   barcode-driven stock control for standing in front of a shelf with no signal. Syncs to the
   server. *(Not yet functional — see [Project status](#project-status) below.)*
 
-Licensed **AGPL-3.0-only**; see [License](#license).
+Licensed **AGPL-3.0-only**. Please check  [License](#license).
 
 ## Project status
 
@@ -84,8 +84,7 @@ is in the [backup and restore runbook](docs/backup-restore.md).
 - **Web UI** — Vue 3 (Composition API) + Pinia + Vite, built and embedded directly into the Go
   binary via `embed.FS`. There is no separate frontend deployment.
 - **Android app** — Kotlin, Jetpack Compose, Material 3, Hilt for DI (package `dev.hho.android`).
-  Designed offline-first around a durable local mirror and outbox; not yet implemented beyond its
-  build scaffold.
+  Designed offline-first around a durable local mirror and outbox. Not yet implemented, track progress in `https://github.com/ankek/household-objects-android/android-app/`.
 - **API contract** — [`server/api/openapi.yaml`](server/api/openapi.yaml) is the single source of
   truth both the server and the Android client are built against; the running server also serves
   it at `/api/v1/openapi.yaml`. CI fails on drift between the document and the implementation.

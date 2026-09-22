@@ -1,0 +1,20 @@
+version: "2"
+
+sql:
+  - engine: "sqlite"
+
+    schema: "internal/storage/migrations"
+
+    queries: "internal/storage/queries"
+
+    gen:
+      go:
+        package: "gen"
+        out: "internal/storage/internal/gen"
+
+        emit_empty_slices: true
+
+        emit_json_tags: false
+
+        rename:
+          items_ft: "ItemsFTS"
