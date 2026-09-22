@@ -1,0 +1,9 @@
+id,name,description,quantity,location_path,location_id,short_code,labels,identifications,attachments,warranty_holder,warranty_provider,warranty_starts_on,warranty_expires_on,warranty_is_lifetime,warranty_notes,purchase_vendor,purchase_purchased_on,purchase_price_minor,purchase_order_reference,purchase_notes,sale_buyer_name,sale_sold_on,sale_price_minor,sale_notes,cf:Color,cf:Model\:Number,cf:Weight (kg),cfx:boolean:Registered,cfx:date:InstalledOn,cfx:text:Assembly Notes,cfx:text:A\|B\:C,cfx:text:備考
+golden-001,"Dining Chair, Oak","Seats four.
+Condition: ""like new"", minor scuff on left leg.",4,Garage/Shelf 1,loc-shelf-1,AB12CD34,Furniture|Style\: Modern\|Chic,serial:SN-100\:Special\|Edition,image:chair (front) café.jpg:a1b2c3,Acme Möbel GmbH,"Acme, Inc.",2023-01-01,2025-01-01,false,"Registered ""online""
+See receipt for details.",,,,,,,,,,,MN-123,,true,,Some assembly required,,
+golden-002,テーブル 🪑 café,,0,,,,,,,,,,,,,,,,,,,,,,,,,,2024-03-04,,,日本語のテスト 🎌
+golden-003,"""Special"" Reading Lamp",,1,House/Garage/Shelf 2,loc-shelf-2,LMP001,"\||A,B",serial:XYZ,manual:lamp-manual.pdf:deadbeef01|image:lampe été 2024.png:cafef00d02,Bob's Warranty House,N/A,,,true,Lifetime coverage; call 1-800-000-0000.,Costco,2022-11-11,999900,,,"Jane ""JJ"" Doe",2025-06-01,50000,Picked up in person; paid cash.,,,12.5,false,,,,
+golden-004,Toolbox,,2,House/Garage/Shelf 2,loc-shelf-2,TB042,,,,,,,,,,Hardware Depot,2021-05-20,4599,"ORD-200,B",Discontinued model; keep for spares.,,,,,,,,,,,value|with:delims\and\backslash,
+golden-005,"Box
+Set",,10,Attic,loc-attic,ZZ99YY88,,,manual:guide.pdf:deadbeef,,,,,,,,,,,,Sam,2025-01-01,2500,,,,,,,,,
