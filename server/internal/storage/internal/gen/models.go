@@ -65,6 +65,15 @@ type DeviceToken struct {
 	ChangeSeq   int64
 }
 
+type FieldVersion struct {
+	GroupID    string
+	EntityType string
+	EntityID   string
+	FieldName  string
+	Version    int64
+	UpdatedAt  int64
+}
+
 type Group struct {
 	ID                    string
 	Name                  string

@@ -37,14 +37,15 @@ info:
     (see that path item's own comment). D2.6's Avery-grid sheet layout is the Vue client's own
     job, not part of this document.
 
-    D1.9's `/sync/pull` and `/sync/push` (T093) are the one deliberate exception to "documented
-    means implemented": both routes are mounted and answer with the request/response envelope
-    below, which IS the final FR-090..FR-096 contract (pinned by
-    `specs/001-hho-ecosystem/contracts/sync-protocol.md`) — but every request today answers
-    `501 Not Implemented` unconditionally, because spec.md's Phase 1 boundary allows `/sync/*` to
-    ship with "contract only, routes declared, may be unimplemented." Real pull and push
-    semantics are D3.1 (T155) and D4.1 (T164, idempotent by `mutation_id`)'s own jobs, replacing
-    the stub's body rather than extending it. See the `sync` tag description below.
+    D1.9's `/sync/pull` and `/sync/push` (T093) started as the one deliberate exception to
+    "documented means implemented": both routes were mounted answering `501 Not Implemented`
+    unconditionally, per spec.md's Phase 1 boundary ("contract only, routes declared, may be
+    unimplemented"). That boundary no longer applies to either route — real pull semantics landed
+    at D3.1 (T155d) and real push semantics, idempotent by `mutation_id`, landed at D4.1/D4.2
+    (T164d/T165c). Both routes now answer with the request/response envelope below, which IS the
+    final FR-090..FR-096 contract (pinned by
+    `specs/001-hho-ecosystem/contracts/sync-protocol.md`), for real. See the `sync` tag
+    description below.
 
     D1.8's `/attachments/*` group is now fully present as of T104a: `POST
     /items/{itemID}/attachments` (upload, T084), `GET /items/{itemID}/attachments` (list an item's
@@ -138,11 +139,10 @@ tags:
       convention.
   - name: sync
     description: >-
-      Device-to-server replication (FR-090–FR-096, D3.1/D4.1). `POST /sync/pull` and
+      Device-to-server replication (FR-090–FR-096, D3.1/D4.1/D4.2). `POST /sync/pull` and
       `POST /sync/push`'s request/response envelopes documented here ARE the final contract
-      (T093, D1.9) — but both routes answer `501 Not Implemented` unconditionally today, per
-      spec.md's Phase 1 boundary ("contract only, routes declared, may be unimplemented"). Real
-      pull lands at D3.1 (T155); real push, idempotent by `mutation_id`, lands at D4.1 (T164).
+      (T093, D1.9), and both routes now implement it for real: pull landed at D3.1 (T155d); push,
+      idempotent by `mutation_id` with field-level merge, landed at D4.1/D4.2 (T164d/T165c).
       Group-scoped like every other route in this document, NOT owner-gated: `device_id`
       identifies the caller's OWN device within their own group, exactly as
       `POST /auth/device-tokens` already does, so any member may sync their own device.
@@ -3402,12 +3402,9 @@ paths:
       tags: [sync]
       summary: Push the caller's device's queued mutations (FR-091, FR-092, FR-093).
       description: >-
-        **Phase 1 status (T093, D1.9).** This route is mounted and the request/response envelope
-        below is the final FR-091..FR-093 contract, pinned by
-        `specs/001-hho-ecosystem/contracts/sync-protocol.md` — but the current implementation
-        answers `501 Not Implemented` unconditionally. Real push semantics (idempotency lookup,
-        field-level merge, conflict recording and `change_seq` allocation) ship at D4.1 (T164),
-        replacing this stub's body rather than extending it.
+        **Implemented (D4.1/D4.2, T164d/T165c).** This route's request/response envelope, pinned
+        by `specs/001-hho-ecosystem/contracts/sync-protocol.md`, is now the operation's real
+        behaviour, not merely a declared contract in front of a stub.
 
         Idempotent by `mutation_id` per `(group_id, mutation_id)` — a retried push carrying an
         already-seen `mutation_id` is answered in `skipped`, never reapplied (FR-091). A
@@ -3416,10 +3413,22 @@ paths:
 
         Merge is field-level: two mutations touching DIFFERENT fields of the same entity both
         apply. Only a same-field divergence — this push's `base_version` for that specific field
-        does not match the server's stored value for it — writes a `conflicts` entry; the
-        server's stored value always wins (FR-092, FR-093). Ordering authority is exclusively
-        server-side (`change_seq` allocation at write time); a mutation's own `base_version` is
-        never trusted for ordering, only for detecting the divergence above.
+        does not match the server's own tracked `field_versions` value for it (a field never
+        individually tracked reads as version 1, migration 0005's bootstrap rule) — writes a
+        `conflicts` entry; the server's stored value always wins (FR-092, FR-093). A single
+        mutation can therefore land in BOTH `applied[]` (for the fields that survived) and
+        `conflicts[]` (for the fields that didn't) — see `SyncPushResponse`'s own description.
+        Ordering authority is exclusively server-side (`change_seq` allocation at write time); a
+        mutation's own `base_version` is never trusted for ordering, only for detecting the
+        divergence above.
+
+        A state-dependent rejection — another device already claimed the same label name or
+        short code, created the same 1:0..1 block, moved a location into a cycle, or named a
+        parent item/edge that no longer exists — is recorded as an ordinary `conflicts[]` entry,
+        never a batch-aborting error (A155): an offline client retrying the identical batch must
+        always reach the idempotency ledger, not fail at the same mutation forever. Only a
+        mutation with no legitimate outcome under ANY server data state still aborts the WHOLE
+        request with `400` — see the `400` response below.
       security:
         - SessionCookie: []
         - DeviceToken: []
@@ -3432,28 +3441,30 @@ paths:
       responses:
         "200":
           description: >-
-            Not reachable in Phase 1: see the `501` response below, which is this operation's
-            actual answer today.
+            The push batch's outcome: `applied[]`/`skipped[]`/`conflicts[]` per mutation
+            (a mutation may appear in more than one array, see `SyncPushResponse`) plus the
+            group's post-batch `new_watermark`. Every state-dependent rejection (A155) is
+            answered here, in `conflicts[]` — never as an error status.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/SyncPushResponse"
         "400":
-          description: The request body was not valid JSON, or a mutation entry failed validation. `detail` is populated.
+          description: >-
+            The request body was not valid JSON; `device_id` was missing; a mutation was
+            structurally malformed (a missing `mutation_id`/`entity_type`/`entity_id`, a negative
+            `base_version`, an unrecognised `entity_type`/`op`, a field name outside the
+            `entity_type`'s accepted set, a rejected `attachment` mutation, or a non-zero
+            `base_version` against a creation-only `entity_type`); or an upper-layer field-value
+            validator rejected a mutation's own field (identification kind, warranty/sale/purchase
+            date format, label colour, A103.2's `field_def_id` consistency). `detail` names the
+            offending mutation's own batch index and `mutation_id`.
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
         "401":
           $ref: "#/components/responses/Unauthorized"
-        "501":
-          description: >-
-            Phase 1's actual, unconditional answer (T093) — see this operation's own description.
-            No `detail`.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
         "426":
           $ref: "#/components/responses/UpgradeRequired"
 
@@ -6492,10 +6503,10 @@ components:
           type: object
           description: >-
             The field-level edit itself. Deliberately free-form here, for the identical FR-139/D2.7
-            reason `SyncChangeEntry` is: the precise per-entity-type field shape is a later,
-            separate documentation deliverable, not this Phase 1 stub's job to anticipate (T093) —
-            except for the two structural deviations A156 already had to pin because push itself
-            depends on them:
+            reason `SyncChangeEntry` is: the precise per-entity-type field shape is FR-139/D2.7's
+            own, separate documentation deliverable to pin as an enum/oneOf, not this schema's job
+            to anticipate — except for the two structural deviations A156 already had to pin because
+            push itself depends on them:
 
             - **`item_id` is REQUIRED inside `fields`**, on both create and update, for
               `warranty_block`, `sold_to_block`, `purchased_from_block`, `item_identification`,

@@ -163,12 +163,18 @@ func (r purchaseRepository) Update(ctx context.Context, p UpdatePurchaseParams) 
 
 	var updated Purchase
 	err := r.writeTx(ctx, func(tx *sql.Tx, q *gen.Queries) error {
+		before, beforeErr := q.GetItemPurchase(ctx, gen.GetItemPurchaseParams{GroupID: r.group(), ItemID: p.ItemID})
+
 		row, err := updatePurchaseTx(ctx, tx, q, r.group(), p)
 		if err != nil {
 			return err
 		}
 		updated = row
-		return nil
+
+		if beforeErr != nil {
+			return fmt.Errorf("storage: purchase for item %q: field-version diff pre-read: %w", p.ItemID, beforeErr)
+		}
+		return recordFieldVersionsTx(ctx, q, r.group(), "purchased_from_block", row.ID, row.Version, p.Now, diffPurchaseFieldVersions(before, row))
 	})
 	if err != nil {
 		return Purchase{}, err

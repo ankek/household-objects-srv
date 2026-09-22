@@ -186,12 +186,18 @@ func (r itemCustomFieldRepository) Update(ctx context.Context, p UpdateItemCusto
 
 	var updated ItemCustomField
 	err := r.writeTx(ctx, func(tx *sql.Tx, q *gen.Queries) error {
+		before, beforeErr := q.GetItemCustomField(ctx, gen.GetItemCustomFieldParams{GroupID: r.group(), ItemID: p.ItemID, ID: p.ID})
+
 		row, err := updateItemCustomFieldTx(ctx, tx, q, r.group(), p)
 		if err != nil {
 			return err
 		}
 		updated = row
-		return nil
+
+		if beforeErr != nil {
+			return fmt.Errorf("storage: custom field %q on item %q: field-version diff pre-read: %w", p.ID, p.ItemID, beforeErr)
+		}
+		return recordFieldVersionsTx(ctx, q, r.group(), "item_custom_field", row.ID, row.Version, p.Now, diffItemCustomFieldFieldVersions(before, row))
 	})
 	if err != nil {
 		return ItemCustomField{}, err

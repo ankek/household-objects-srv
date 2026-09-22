@@ -185,49 +185,6 @@ func TestApplyMutationUpdateMatchingBaseVersionAppliesAndBumpsVersion(t *testing
 	}
 }
 
-func TestApplyMutationStaleBaseVersionConflictsEveryNamedFieldAndWritesNothing(t *testing.T) {
-	commitA, _, scopeA, _, _ := pushCommitScope(t)
-
-	_, err := scopeA.Items().Create(t.Context(), CreateItemParams{
-		ID: "item-stale-1", Name: "Hammer", Quantity: 1, ShortCode: "SC-STALE1", Now: 1,
-	})
-	if err != nil {
-		t.Fatalf("seed item: %v", err)
-	}
-	if _, err := scopeA.Items().Update(t.Context(), UpdateItemParams{
-		ItemID: "item-stale-1", Name: "Hammer", Quantity: 9, ExpectedVersion: 1, Now: 2,
-	}); err != nil {
-		t.Fatalf("advance item to version 2: %v", err)
-	}
-
-	outcome, err := commitA.ApplyMutation(t.Context(), PushMutation{
-		MutationID:  "mut-stale-1",
-		EntityType:  "item",
-		EntityID:    "item-stale-1",
-		BaseVersion: 1,
-		Fields:      pushFields(t, map[string]any{"name": "Mallet", "quantity": 2}),
-		Now:         3000,
-	})
-	if err != nil {
-		t.Fatalf("ApplyMutation: %v", err)
-	}
-	if outcome.Applied {
-		t.Fatalf("outcome.Applied = true, want false for a stale base_version")
-	}
-	wantConflicts := []string{"name", "quantity"}
-	if !equalStringSlices(outcome.ConflictFields, wantConflicts) {
-		t.Fatalf("outcome.ConflictFields = %v, want %v", outcome.ConflictFields, wantConflicts)
-	}
-
-	item, err := scopeA.Items().Get(t.Context(), "item-stale-1")
-	if err != nil {
-		t.Fatalf("Get item: %v", err)
-	}
-	if item.Name != "Hammer" || item.Quantity != 9 || item.Version != 2 {
-		t.Fatalf("item after conflicting push = %+v, want unchanged (Name=Hammer Quantity=9 Version=2)", item)
-	}
-}
-
 func TestApplyMutationUpdateAbsentEntityConflictsWithoutResurrection(t *testing.T) {
 	commitA, _, scopeA, _, _ := pushCommitScope(t)
 

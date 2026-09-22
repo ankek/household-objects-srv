@@ -162,12 +162,18 @@ func (r warrantyRepository) Update(ctx context.Context, p UpdateWarrantyParams) 
 
 	var updated Warranty
 	err := r.writeTx(ctx, func(tx *sql.Tx, q *gen.Queries) error {
+		before, beforeErr := q.GetItemWarranty(ctx, gen.GetItemWarrantyParams{GroupID: r.group(), ItemID: p.ItemID})
+
 		row, err := updateWarrantyTx(ctx, tx, q, r.group(), p)
 		if err != nil {
 			return err
 		}
 		updated = row
-		return nil
+
+		if beforeErr != nil {
+			return fmt.Errorf("storage: warranty for item %q: field-version diff pre-read: %w", p.ItemID, beforeErr)
+		}
+		return recordFieldVersionsTx(ctx, q, r.group(), "warranty_block", row.ID, row.Version, p.Now, diffWarrantyFieldVersions(before, row))
 	})
 	if err != nil {
 		return Warranty{}, err

@@ -219,6 +219,32 @@ var unscopedWriteAllowlist = map[string]string{
 		"this very statement's own error, not by a pre-check SELECT ahead of it, so there is " +
 		"still no existing row being read here to leak (a fresh INSERT, not a filtered " +
 		"SELECT/UPDATE).",
+	"CreateConflict": "T165b: group_id is an explicit, required, positional VALUES column; " +
+		"conflicts.group_id is NOT NULL REFERENCES groups (id) with no default, so sqlc refuses " +
+		"to compile this statement without it -- the identical shape as CreateMutation, " +
+		"CreateImportSession, CreateAttachment, CreateLabel and every other Create* already " +
+		"allowlisted here for the same reason. Like CreateImportSession this row's only parent is " +
+		"the group itself (no composite FOREIGN KEY to a parent item -- entity_type/entity_id are " +
+		"polymorphic, unconstrained TEXT, the identical shape mutations.entity_type/entity_id " +
+		"already have), so group_id being an explicit, required column IS the entire tenant " +
+		"guarantee this statement carries, and it is the one this lint would otherwise (wrongly) " +
+		"flag as unscoped. Unlike CreateMutation this table carries NO UNIQUE index of its own to " +
+		"collide on beyond its own primary key, so there is not even a same-table collision to " +
+		"detect here -- a fresh INSERT with no existing row being read to leak, full stop.",
+	"UpsertFieldVersion": "T165b: group_id is an explicit, required, positional VALUES column; " +
+		"field_versions.group_id is NOT NULL REFERENCES groups (id) with no default (migration " +
+		"0005), so sqlc refuses to compile this statement without it -- the identical shape as " +
+		"CreateConflict, CreateMutation and every other Create* already allowlisted here for the " +
+		"same reason. Unlike an ordinary Create* this statement is an UPSERT (INSERT ... ON " +
+		"CONFLICT (group_id, entity_type, entity_id, field_name) DO UPDATE), so it CAN touch an " +
+		"existing row -- but the row it can touch is pinned to the exact composite primary key " +
+		"tuple its own VALUES clause supplies, INCLUDING group_id, so the DO UPDATE branch can " +
+		"only ever land on that one tuple, never a different tenant's row with the same " +
+		"entity_type/entity_id/field_name. group_id being an explicit, required VALUES column is " +
+		"still the entire tenant guarantee this statement carries, and it is the one this lint " +
+		"would otherwise (wrongly) flag as unscoped, since neither the VALUES list nor the ON " +
+		"CONFLICT column list nor the DO UPDATE SET clause contains the literal `group_id = ...` " +
+		"predicate shape this lint's regex looks for.",
 }
 
 var queryNamePattern = regexp.MustCompile(`^--\s*name:\s*(\w+)\s+:(\w+)`)

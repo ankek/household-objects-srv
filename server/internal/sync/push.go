@@ -75,7 +75,10 @@ func Push(ctx context.Context, commit storage.PushCommitRepository, batch PushBa
 			Op:          storage.PushOp(m.Op),
 		})
 		if err != nil {
-			return PushResult{}, &PushMutationError{Index: i, MutationID: m.MutationID, Err: err}
+			if storage.IsPushStructuralError(err) {
+				return PushResult{}, &PushMutationError{Index: i, MutationID: m.MutationID, Err: err}
+			}
+			return PushResult{}, fmt.Errorf("sync: push: mutation[%d] %q: %w", i, m.MutationID, err)
 		}
 
 		if outcome.Skipped {

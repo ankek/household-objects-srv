@@ -209,12 +209,18 @@ func (r itemRepository) Update(ctx context.Context, p UpdateItemParams) (Item, e
 
 	var updated Item
 	err := r.writeTx(ctx, func(tx *sql.Tx, q *gen.Queries) error {
+		before, beforeErr := q.GetItem(ctx, gen.GetItemParams{GroupID: r.group(), ItemID: p.ItemID})
+
 		row, err := updateItemTx(ctx, tx, q, r.group(), p)
 		if err != nil {
 			return err
 		}
 		updated = row
-		return nil
+
+		if beforeErr != nil {
+			return fmt.Errorf("storage: item %q: field-version diff pre-read: %w", p.ItemID, beforeErr)
+		}
+		return recordFieldVersionsTx(ctx, q, r.group(), "item", row.ID, row.Version, p.Now, diffItemFieldVersions(before, row))
 	})
 	if err != nil {
 		return Item{}, err

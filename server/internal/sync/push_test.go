@@ -1,8 +1,10 @@
 package sync
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/ankek/Household-Objects-Dev/server/internal/storage"
 	"testing"
 )
@@ -257,5 +259,94 @@ func TestPushItemLabelDeleteOp(t *testing.T) {
 	}
 	if len(labels) != 0 {
 		t.Fatalf("ListForItem = %+v, want empty after delete", labels)
+	}
+}
+
+type fakePushCommit struct {
+	applyErr error
+}
+
+func (f fakePushCommit) ApplyMutation(context.Context, storage.PushMutation) (storage.PushOutcome, error) {
+	return storage.PushOutcome{}, f.applyErr
+}
+
+func (f fakePushCommit) Watermark(context.Context) (int64, error) { return 0, nil }
+
+func TestPushClassifiesApplyMutationErrors(t *testing.T) {
+	tests := []struct {
+		name              string
+		applyErr          error
+		wantMutationErr   bool
+		wantErrIsSentinel error
+	}{
+		{
+			name:            "structural error becomes a *PushMutationError",
+			applyErr:        storage.ErrPushAttachmentRejected,
+			wantMutationErr: true,
+		},
+		{
+			name:            "transient ledger failure is NOT a *PushMutationError",
+			applyErr:        errors.New("storage: push: check mutation ledger for \"mut-1\": disk I/O error"),
+			wantMutationErr: false,
+		},
+		{
+			name:              "ErrVersionMismatch backstop is NOT a *PushMutationError",
+			applyErr:          fmt.Errorf("storage: item: update: %w", storage.ErrVersionMismatch),
+			wantMutationErr:   false,
+			wantErrIsSentinel: storage.ErrVersionMismatch,
+		},
+		{
+			name:              "validate()'s missing-field error IS a *PushMutationError",
+			applyErr:          fmt.Errorf("%w: %q", storage.ErrPushMissingField, "entity_id"),
+			wantMutationErr:   true,
+			wantErrIsSentinel: storage.ErrPushMissingField,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			commit := fakePushCommit{applyErr: tt.applyErr}
+
+			_, err := Push(t.Context(), commit, PushBatch{
+				Mutations: []PushMutation{{MutationID: "mut-1", EntityType: "item", EntityID: "item-1", BaseVersion: 0, Fields: pushFields(t, map[string]any{"name": "Drill"})}},
+				Now:       1000,
+			})
+			if err == nil {
+				t.Fatalf("Push: got nil error, want non-nil")
+			}
+
+			var mutErr *PushMutationError
+			gotMutationErr := errors.As(err, &mutErr)
+			if gotMutationErr != tt.wantMutationErr {
+				t.Fatalf("errors.As(err, *PushMutationError) = %v, want %v (err = %v, %T)", gotMutationErr, tt.wantMutationErr, err, err)
+			}
+			if tt.wantErrIsSentinel != nil && !errors.Is(err, tt.wantErrIsSentinel) {
+				t.Fatalf("errors.Is(err, %v) = false, want true (err = %v)", tt.wantErrIsSentinel, err)
+			}
+		})
+	}
+}
+
+func TestPushClientMalformedMutationIsAPushMutationError(t *testing.T) {
+	s := newSyncTestStorage(t)
+	seedGroup(t, s, "groupA")
+	commit := pushCommitFor(t, s, "groupA")
+
+	_, err := Push(t.Context(), commit, PushBatch{
+		Mutations: []PushMutation{
+			{MutationID: "mut-no-entity-id", EntityType: "item", EntityID: "", BaseVersion: 0, Fields: pushFields(t, map[string]any{"name": "Drill"})},
+		},
+		Now: 1000,
+	})
+
+	var mutErr *PushMutationError
+	if !errors.As(err, &mutErr) {
+		t.Fatalf("Push error = %v (%T), want *PushMutationError", err, err)
+	}
+	if mutErr.Index != 0 || mutErr.MutationID != "mut-no-entity-id" {
+		t.Fatalf("PushMutationError = %+v, want Index=0 MutationID=mut-no-entity-id", mutErr)
+	}
+	if !errors.Is(err, storage.ErrPushMissingField) {
+		t.Fatalf("errors.Is(err, storage.ErrPushMissingField) = false, want true (err = %v)", err)
 	}
 }
