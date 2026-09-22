@@ -6447,7 +6447,15 @@ components:
 
     SyncMutation:
       type: object
-      description: One queued client-side edit, as `POST /sync/push`'s `mutations[]` carries it (FR-091).
+      description: >-
+        One queued client-side edit, as `POST /sync/push`'s `mutations[]` carries it (FR-091).
+        State-dependent rejections (another device already created the same block, claimed the same
+        label name, moved a location into a cycle, ...) are never a batch-aborting error — they come
+        back as a `conflicts[]` entry instead, so a queued mutation always reaches the idempotency
+        ledger and an offline device can never wedge on a replayed batch (A155). Only a
+        STRUCTURALLY invalid mutation (unrecognised `entity_type`/`op`, a field name this
+        `entity_type` does not accept, a rejected `attachment`, `base_version != 0` against a
+        creation-only `entity_type`) still aborts the whole request with `400`.
       required: [mutation_id, entity_type, entity_id, base_version, fields]
       properties:
         mutation_id:
@@ -6455,7 +6463,8 @@ components:
           description: >-
             A client-generated identifier, unique per `(group_id, mutation_id)` (FR-091). A retried
             push carrying a `mutation_id` this group has already seen is answered in `skipped`,
-            never reapplied.
+            never reapplied — including one this group previously answered in `conflicts[]`: a
+            recorded conflict replays as `skipped` exactly like a recorded `applied` does (A155).
         entity_type:
           type: string
           description: >-
@@ -6464,19 +6473,58 @@ components:
             `SyncTombstoneEntry.entity_type` is.
         entity_id:
           type: string
+          description: >-
+            The target row's own id — client-minted for a create (`base_version == 0`), or the id
+            the client believes it last read for an update. Required on every mutation by this
+            schema, but semantically UNUSED by `op: delete` (A156): a delete addresses its edge via
+            `fields.item_id`/`fields.label_id` instead, since an item_label edge's own id is not
+            otherwise addressable — send the edge's own id here anyway (a client that received it
+            from a prior pull has one to send) for schema uniformity with every other mutation.
         base_version:
           type: integer
           format: int64
           description: >-
             The `version` this mutation was computed against, for FR-092/FR-093's field-level
             conflict check — never trusted for ordering (that authority is exclusively server-side,
-            `change_seq` allocation at write time).
+            `change_seq` allocation at write time). Ignored for `op: delete` (A156): an item_label
+            edge has no user-editable field for FR-090 to guard.
         fields:
           type: object
           description: >-
             The field-level edit itself. Deliberately free-form here, for the identical FR-139/D2.7
             reason `SyncChangeEntry` is: the precise per-entity-type field shape is a later,
-            separate documentation deliverable, not this Phase 1 stub's job to anticipate (T093).
+            separate documentation deliverable, not this Phase 1 stub's job to anticipate (T093) —
+            except for the two structural deviations A156 already had to pin because push itself
+            depends on them:
+
+            - **`item_id` is REQUIRED inside `fields`**, on both create and update, for
+              `warranty_block`, `sold_to_block`, `purchased_from_block`, `item_identification`,
+              `item_custom_field` and `stock_adjustment`. REST addresses every one of these by a
+              parent item id carried in the URL, never resent in the body; push has no URL, so
+              `item_id` has to travel inside `fields` instead. Every other field name for these six
+              types matches that entity's REST request schema exactly (see docs/sync-protocol.md).
+
+            - **`item_label` uses the field names `item_id` and `label_id`** for BOTH `op: upsert`
+              (create — attaches the label; `item_label` has no update, only creation and deletion)
+              and `op: delete` (detaches it). Its REST route (`PUT`/`DELETE
+              /items/{itemID}/labels/{labelID}`) carries no request body at all, so there is no REST
+              schema for these two names to mirror — push invents them.
+
+            Any field name outside an `entity_type`'s own accepted set (its REST schema's own
+            properties, plus `item_id` for the six types above, plus `item_id`/`label_id` for
+            `item_label`) is rejected — the whole mutation, not silently ignored.
+        op:
+          type: string
+          enum: [upsert, delete]
+          description: >-
+            Selects upsert (create-or-update, D4.1/D4.2's original and still the only behaviour for
+            ten of the eleven closed-set entity types) or delete (A156, FR-115: "add/remove labels"
+            offline). OPTIONAL and additive (NFR-033) — omitted means `upsert`, the wire shape every
+            mutation had before this field existed. Only `item_label` supports `delete` in this
+            pass; `delete` against any other `entity_type` is a structural `400`. Deleting an edge
+            that is not currently live (never attached, or already detached by an earlier mutation)
+            is a whole-entity conflict (`field_name: "_entity"`, A151) — the desired end state
+            already holds, but that is not the same as this call having written anything.
 
     SyncPushRequest:
       type: object

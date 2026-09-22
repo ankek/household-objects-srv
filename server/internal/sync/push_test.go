@@ -155,3 +155,107 @@ func TestPushNilCommitRepositoryIsRejected(t *testing.T) {
 		t.Fatalf("Push(nil) error = %v, want ErrNoRepository", err)
 	}
 }
+
+func TestPushStructuralErrorIsAPushMutationErrorNamingIndexAndMutationID(t *testing.T) {
+	s := newSyncTestStorage(t)
+	seedGroup(t, s, "groupA")
+	commit := pushCommitFor(t, s, "groupA")
+
+	_, err := Push(t.Context(), commit, PushBatch{
+		Mutations: []PushMutation{
+			{MutationID: "mut-ok", EntityType: "item", EntityID: "item-1", BaseVersion: 0, Fields: pushFields(t, map[string]any{"name": "Drill"})},
+			{MutationID: "mut-bad", EntityType: "attachment", EntityID: "attach-1", BaseVersion: 0, Fields: pushFields(t, map[string]any{})},
+		},
+		Now: 1000,
+	})
+
+	var mutErr *PushMutationError
+	if !errors.As(err, &mutErr) {
+		t.Fatalf("Push error = %v (%T), want *PushMutationError", err, err)
+	}
+	if mutErr.Index != 1 || mutErr.MutationID != "mut-bad" {
+		t.Fatalf("PushMutationError = %+v, want Index=1 MutationID=mut-bad", mutErr)
+	}
+	if !errors.Is(err, storage.ErrPushAttachmentRejected) {
+		t.Fatalf("errors.Is(err, storage.ErrPushAttachmentRejected) = false, want true (Unwrap must reach the sentinel)")
+	}
+}
+
+func TestPushStateDependentConflictDoesNotAbortTheBatch(t *testing.T) {
+	s := newSyncTestStorage(t)
+	seedGroup(t, s, "groupA")
+	commit := pushCommitFor(t, s, "groupA")
+
+	scope, err := s.ForGroup(storage.MustGroupID("groupA"))
+	if err != nil {
+		t.Fatalf("ForGroup: %v", err)
+	}
+	if _, err := scope.Labels().Create(t.Context(), storage.CreateLabelParams{
+		ID: "label-existing", Name: "Garage", Color: "#123456", Now: 1,
+	}); err != nil {
+		t.Fatalf("seed existing label: %v", err)
+	}
+
+	result, err := Push(t.Context(), commit, PushBatch{
+		Mutations: []PushMutation{
+			{MutationID: "mut-conflict", EntityType: "label", EntityID: "label-loser", BaseVersion: 0,
+				Fields: pushFields(t, map[string]any{"name": "Garage", "color": "#abcdef"})},
+			{MutationID: "mut-after-conflict", EntityType: "item", EntityID: "item-after", BaseVersion: 0,
+				Fields: pushFields(t, map[string]any{"name": "Drill"})},
+		},
+		Now: 1000,
+	})
+	if err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if len(result.Conflicts) != 1 || result.Conflicts[0].MutationID != "mut-conflict" || result.Conflicts[0].FieldName != "name" {
+		t.Fatalf("Conflicts = %+v, want one entry for mut-conflict field_name=name", result.Conflicts)
+	}
+	if len(result.Applied) != 1 || result.Applied[0].MutationID != "mut-after-conflict" {
+		t.Fatalf("Applied = %+v, want one entry for mut-after-conflict -- the conflict must not abort the batch", result.Applied)
+	}
+}
+
+func TestPushItemLabelDeleteOp(t *testing.T) {
+	s := newSyncTestStorage(t)
+	seedGroup(t, s, "groupA")
+	commit := pushCommitFor(t, s, "groupA")
+	scope, err := s.ForGroup(storage.MustGroupID("groupA"))
+	if err != nil {
+		t.Fatalf("ForGroup: %v", err)
+	}
+
+	item, err := scope.Items().Create(t.Context(), storage.CreateItemParams{ID: "item-1", Name: "Box", ShortCode: "SC-1", Now: 1})
+	if err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+	label, err := scope.Labels().Create(t.Context(), storage.CreateLabelParams{ID: "label-1", Name: "Fragile", Color: "#ff0000", Now: 1})
+	if err != nil {
+		t.Fatalf("seed label: %v", err)
+	}
+	if err := scope.ItemLabels().Attach(t.Context(), storage.AttachLabelParams{ID: "edge-1", ItemID: item.ID, LabelID: label.ID, Now: 1}); err != nil {
+		t.Fatalf("seed attach: %v", err)
+	}
+
+	result, err := Push(t.Context(), commit, PushBatch{
+		Mutations: []PushMutation{
+			{MutationID: "mut-delete-edge", EntityType: "item_label", EntityID: "edge-1",
+				Fields: pushFields(t, map[string]any{"item_id": item.ID, "label_id": label.ID}), Op: "delete"},
+		},
+		Now: 2000,
+	})
+	if err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if len(result.Applied) != 1 || result.Applied[0].MutationID != "mut-delete-edge" {
+		t.Fatalf("Applied = %+v, want one entry for mut-delete-edge", result.Applied)
+	}
+
+	labels, err := scope.ItemLabels().ListForItem(t.Context(), item.ID)
+	if err != nil {
+		t.Fatalf("ListForItem: %v", err)
+	}
+	if len(labels) != 0 {
+		t.Fatalf("ListForItem = %+v, want empty after delete", labels)
+	}
+}
