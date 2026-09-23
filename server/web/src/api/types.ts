@@ -113,6 +113,16 @@ export interface CustomFieldDefListResponse {
   readonly custom_field_defs: readonly CustomFieldDef[]
 }
 
+export interface CustomFieldDefCreateRequest {
+  readonly name: string
+  readonly field_type: CustomFieldType
+  readonly display_order: number
+}
+
+export interface CustomFieldDefUpdateRequest extends CustomFieldDefCreateRequest {
+  readonly version: number
+}
+
 export interface ItemCustomField extends Versioned {
   readonly item_id?: string
   readonly field_def_id?: string
@@ -133,6 +143,13 @@ export interface GroupVisibility {
   readonly sale_visible: boolean
   readonly purchase_visible: boolean
   readonly version?: number
+}
+
+export interface GroupVisibilityUpdateRequest {
+  readonly warranty_visible: boolean
+  readonly sale_visible: boolean
+  readonly purchase_visible: boolean
+  readonly version: number
 }
 
 export type AttachmentCategory = 'image' | 'manual' | 'warranty' | 'receipt' | 'general'
@@ -215,6 +232,18 @@ export interface InviteCreateResponse {
   readonly expires_at: number
 }
 
+export interface InviteRedeemRequest {
+  readonly token: string
+  readonly username: string
+  readonly password: string
+}
+
+export interface InviteRedeemResponse {
+  readonly group_id: string
+  readonly user_id: string
+  readonly username: string
+}
+
 export interface StatusResponse {
   readonly status: 'ok'
   readonly version: string
@@ -263,4 +292,73 @@ export interface ReportLocationItemCountRow {
 
 export interface ReportItemCountByLocationResponse {
   readonly rows: readonly ReportLocationItemCountRow[]
+}
+
+export interface ImportUploadResponse {
+  readonly import_id: string
+}
+
+export interface ImportPreviewRowError {
+  readonly line: number
+  readonly column?: string
+  readonly message: string
+}
+
+export type ImportRowAction = 'create' | 'update' | 'unchanged' | 'error'
+
+export type ImportRowChange =
+  | 'name'
+  | 'description'
+  | 'quantity'
+  | 'location_id'
+  | 'labels'
+  | 'identifications'
+  | 'warranty'
+  | 'purchase'
+  | 'sale'
+  | 'custom_fields'
+
+export interface ImportPreviewRow {
+  readonly line: number
+  readonly action: ImportRowAction
+  readonly item_id?: string
+  readonly name?: string
+  readonly changes?: readonly ImportRowChange[]
+  readonly errors?: readonly ImportPreviewRowError[]
+}
+
+export interface ImportPreviewSummary {
+  readonly create: number
+  readonly update: number
+  readonly unchanged: number
+  readonly error: number
+}
+
+export interface ImportPreviewResponse {
+  readonly import_id: string
+  readonly rows: readonly ImportPreviewRow[]
+  readonly summary: ImportPreviewSummary
+}
+
+export interface ImportCommitSummary {
+  readonly created: number
+  readonly updated: number
+  readonly unchanged: number
+}
+
+export interface ImportCommitCreatedItem {
+  readonly line: number
+  readonly item_id: string
+}
+
+export interface ImportCommitResponse {
+  readonly import_id: string
+  readonly summary: ImportCommitSummary
+  readonly created_items: readonly ImportCommitCreatedItem[]
+}
+
+export interface ImportCommitRejectedResponse {
+  readonly import_id: string
+  readonly rows: readonly ImportPreviewRow[]
+  readonly summary: ImportPreviewSummary
 }

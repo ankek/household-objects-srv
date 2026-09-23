@@ -10,6 +10,10 @@ const SESSIONS = 'GET /api/v1/auth/sessions'
 const DEVICES = 'GET /api/v1/auth/device-tokens'
 const INVITES = 'GET /api/v1/invites'
 const CREATE_INVITE = 'POST /api/v1/invites'
+const VISIBILITY = 'GET /api/v1/groups/detail-visibility'
+const PUT_VISIBILITY = 'PUT /api/v1/groups/detail-visibility'
+const FIELD_DEFS = 'GET /api/v1/custom-field-defs'
+const CREATE_FIELD_DEF = 'POST /api/v1/custom-field-defs'
 
 function baseRoutes(overrides: Routes = {}): Routes {
   return {
@@ -17,6 +21,14 @@ function baseRoutes(overrides: Routes = {}): Routes {
     [SESSIONS]: () => jsonResponse(200, { sessions: [] }),
     [DEVICES]: () => jsonResponse(200, { device_tokens: [] }),
     [INVITES]: () => jsonResponse(200, { invites: [] }),
+    [VISIBILITY]: () =>
+      jsonResponse(200, {
+        warranty_visible: false,
+        sale_visible: false,
+        purchase_visible: false,
+        version: 1,
+      }),
+    [FIELD_DEFS]: () => jsonResponse(200, { custom_field_defs: [] }),
     ...overrides,
   }
 }
@@ -44,6 +56,29 @@ async function mountSettings(routes: Routes, role: 'owner' | 'member' = 'owner')
   await wrapper.vm.$nextTick()
   return { wrapper, fetchMock }
 }
+
+describe('SettingsView after a reload (T154e, no logIn call)', () => {
+  it('shows an owner-only section once session.boot() alone has resolved the identity', async () => {
+    const fetchMock = stubRoutedFetch(
+      baseRoutes({
+        ['GET /api/v1/auth/me']: () =>
+          jsonResponse(200, { group_id: 'g', user_id: 'u', username: 'anton', role: 'owner' }),
+      }),
+    )
+    const session = useSessionStore()
+    expect(session.user).toBeNull()
+
+    await session.boot()
+    const wrapper = mount(SettingsView, { global: { plugins: [pinia] } })
+    await flush()
+    await wrapper.vm.$nextTick()
+
+    expect(fetchMock.mock.calls.some(([input]) => input === '/api/v1/auth/me')).toBe(true)
+    expect(session.isOwner).toBe(true)
+    expect(wrapper.text()).toContain('Backup and restore')
+    expect(wrapper.text()).toContain('Invite links let someone join')
+  })
+})
 
 describe('SettingsView placeholders (FR-105 gaps, A115)', () => {
   it('never renders a registration section — FR-105 dropped that sub-screen (A115)', async () => {
@@ -185,6 +220,24 @@ describe('SettingsView invites (owner-gated, FR-006)', () => {
 
     expect(wrapper.find('.settings__invite-code').exists()).toBe(false)
     expect(wrapper.text()).toContain('active')
+  })
+
+  it('offers a copyable /join link built from the token, alongside the raw token', async () => {
+    const { wrapper } = await mountSettings(
+      baseRoutes({
+        [CREATE_INVITE]: () =>
+          jsonResponse(201, { id: 'inv-1', token: 'raw-token-xyz', expires_at: Date.now() + 1000 }),
+      }),
+    )
+
+    await wrapper.get('.settings__invite-create').trigger('click')
+    await flush()
+    await wrapper.vm.$nextTick()
+
+    const codes = wrapper.findAll('.settings__invite-code')
+    expect(codes).toHaveLength(2)
+    expect(codes[0]!.text()).toBe('raw-token-xyz')
+    expect(codes[1]!.text()).toBe(`${window.location.origin}/join?token=raw-token-xyz`)
   })
 
   it('classifies redeemed, expired, and still-active invites correctly, offering Revoke only for the active one', async () => {
@@ -348,5 +401,345 @@ describe('SettingsView sessions and devices (FR-004, self-scoped for either role
       .find((s) => s.get('.settings__section-title').text() === 'Sessions')!
     expect(sessionsCard.get('[role="alert"]').text()).toContain('Internal Server Error')
     expect(wrapper.text()).toContain('No registered devices.')
+  })
+})
+
+describe('SettingsView item detail-block visibility (FR-011, owner-only, T154b)', () => {
+  it('renders no Item detail blocks section for a non-owner, and never calls GET /groups/detail-visibility', async () => {
+    const { wrapper, fetchMock } = await mountSettings(baseRoutes(), 'member')
+
+    expect(wrapper.text()).not.toContain('Item detail blocks')
+    expect(
+      fetchMock.mock.calls.some(([input]) => input === '/api/v1/groups/detail-visibility'),
+    ).toBe(false)
+  })
+
+  it('loads the current flags into three checkboxes for an owner', async () => {
+    const { wrapper } = await mountSettings(
+      baseRoutes({
+        [VISIBILITY]: () =>
+          jsonResponse(200, {
+            warranty_visible: true,
+            sale_visible: false,
+            purchase_visible: true,
+            version: 3,
+          }),
+      }),
+      'owner',
+    )
+
+    const card = wrapper
+      .findAll('.settings__section')
+      .find((s) => s.get('.settings__section-title').text() === 'Item detail blocks')!
+    const checkboxes = card.findAll('input[type="checkbox"]')
+    expect(checkboxes).toHaveLength(3)
+    expect((checkboxes[0]!.element as HTMLInputElement).checked).toBe(true)
+    expect((checkboxes[1]!.element as HTMLInputElement).checked).toBe(true)
+    expect((checkboxes[2]!.element as HTMLInputElement).checked).toBe(false)
+  })
+
+  it('sends the toggled flags and the read version on save', async () => {
+    const { wrapper, fetchMock } = await mountSettings(
+      baseRoutes({
+        [PUT_VISIBILITY]: () =>
+          jsonResponse(200, {
+            warranty_visible: true,
+            sale_visible: false,
+            purchase_visible: false,
+            version: 2,
+          }),
+      }),
+      'owner',
+    )
+
+    const card = wrapper
+      .findAll('.settings__section')
+      .find((s) => s.get('.settings__section-title').text() === 'Item detail blocks')!
+    await card.findAll('input[type="checkbox"]')[0]!.setValue(true)
+    await card.get('form').trigger('submit')
+    await flush()
+
+    const call = fetchMock.mock.calls.find(
+      ([input, init]) => input === '/api/v1/groups/detail-visibility' && init?.method === 'PUT',
+    )
+    expect(call).toBeDefined()
+    expect(JSON.parse(call![1]!.body as string)).toEqual({
+      warranty_visible: true,
+      sale_visible: false,
+      purchase_visible: false,
+      version: 1,
+    })
+  })
+
+  it('reloads from the server and reports a conflict on a 409', async () => {
+    const { wrapper } = await mountSettings(baseRoutes(), 'owner')
+
+    stubRoutedFetch(
+      baseRoutes({
+        [PUT_VISIBILITY]: () => jsonResponse(409, { title: 'Conflict', status: 409 }),
+      }),
+    )
+
+    const card = wrapper
+      .findAll('.settings__section')
+      .find((s) => s.get('.settings__section-title').text() === 'Item detail blocks')!
+    await card.get('form').trigger('submit')
+    await flush()
+    await wrapper.vm.$nextTick()
+
+    expect(card.get('[role="alert"]').text()).toContain('Someone else changed')
+  })
+})
+
+describe('SettingsView custom-field definitions (FR-017, owner-only, T154b)', () => {
+  function fieldDefsCard(wrapper: ReturnType<typeof mount>) {
+    return wrapper
+      .findAll('.settings__section')
+      .find((s) => s.get('.settings__section-title').text() === 'Custom fields')!
+  }
+
+  it('renders no Custom fields section for a non-owner, and never calls the writes', async () => {
+    const { wrapper, fetchMock } = await mountSettings(baseRoutes(), 'member')
+
+    expect(wrapper.text()).not.toContain('Custom fields')
+    expect(fetchMock.mock.calls.some(([input]) => input === '/api/v1/custom-field-defs')).toBe(
+      false,
+    )
+  })
+
+  it('lists existing definitions with their type', async () => {
+    const { wrapper } = await mountSettings(
+      baseRoutes({
+        [FIELD_DEFS]: () =>
+          jsonResponse(200, {
+            custom_field_defs: [
+              {
+                id: 'f1',
+                name: 'Color',
+                field_type: 'text',
+                display_order: 0,
+                created_at: 0,
+                updated_at: 0,
+                version: 1,
+              },
+            ],
+          }),
+      }),
+      'owner',
+    )
+
+    const card = fieldDefsCard(wrapper)
+    expect(card.text()).toContain('Color')
+    expect(card.text()).toContain('text')
+  })
+
+  it('creates a new definition with the entered name and type', async () => {
+    const { wrapper, fetchMock } = await mountSettings(
+      baseRoutes({
+        [CREATE_FIELD_DEF]: () =>
+          jsonResponse(201, {
+            id: 'f2',
+            name: 'Room',
+            field_type: 'number',
+            display_order: 0,
+            created_at: 0,
+            updated_at: 0,
+            version: 1,
+          }),
+      }),
+      'owner',
+    )
+
+    const card = fieldDefsCard(wrapper)
+    await card.get('[aria-label="New field name"]').setValue('Room')
+    await card.find('select').setValue('number')
+    await card.get('.settings__field-def-create').trigger('submit')
+    await flush()
+    await wrapper.vm.$nextTick()
+
+    const call = fetchMock.mock.calls.find(
+      ([input, init]) => input === '/api/v1/custom-field-defs' && init?.method === 'POST',
+    )
+    expect(call).toBeDefined()
+    expect(JSON.parse(call![1]!.body as string)).toEqual({
+      name: 'Room',
+      field_type: 'number',
+      display_order: 0,
+    })
+    expect(card.text()).toContain('Room')
+  })
+
+  it('renames a definition, sending its current display_order and version', async () => {
+    const { wrapper } = await mountSettings(
+      baseRoutes({
+        [FIELD_DEFS]: () =>
+          jsonResponse(200, {
+            custom_field_defs: [
+              {
+                id: 'f1',
+                name: 'Color',
+                field_type: 'text',
+                display_order: 5,
+                created_at: 0,
+                updated_at: 0,
+                version: 3,
+              },
+            ],
+          }),
+      }),
+      'owner',
+    )
+
+    const fetchMock = stubRoutedFetch(
+      baseRoutes({
+        [FIELD_DEFS]: () =>
+          jsonResponse(200, {
+            custom_field_defs: [
+              {
+                id: 'f1',
+                name: 'Color',
+                field_type: 'text',
+                display_order: 5,
+                created_at: 0,
+                updated_at: 0,
+                version: 3,
+              },
+            ],
+          }),
+        ['PUT /api/v1/custom-field-defs/f1']: () =>
+          jsonResponse(200, {
+            id: 'f1',
+            name: 'Colour',
+            field_type: 'text',
+            display_order: 5,
+            created_at: 0,
+            updated_at: 0,
+            version: 4,
+          }),
+      }),
+    )
+
+    const card = fieldDefsCard(wrapper)
+    await card
+      .findAll('button')
+      .find((b) => b.text() === 'Rename')!
+      .trigger('click')
+    await wrapper.vm.$nextTick()
+
+    await card.get('[aria-label="Name"]').setValue('Colour')
+    await card.get('form').trigger('submit')
+    await flush()
+    await wrapper.vm.$nextTick()
+
+    const call = fetchMock.mock.calls.find(
+      ([input, init]) => input === '/api/v1/custom-field-defs/f1' && init?.method === 'PUT',
+    )
+    expect(call).toBeDefined()
+    expect(JSON.parse(call![1]!.body as string)).toEqual({
+      name: 'Colour',
+      field_type: 'text',
+      display_order: 5,
+      version: 3,
+    })
+    expect(card.text()).toContain('Colour')
+  })
+
+  it('shows an inline error, without removing the row, when a rename answers 409', async () => {
+    const { wrapper } = await mountSettings(
+      baseRoutes({
+        [FIELD_DEFS]: () =>
+          jsonResponse(200, {
+            custom_field_defs: [
+              {
+                id: 'f1',
+                name: 'Color',
+                field_type: 'text',
+                display_order: 0,
+                created_at: 0,
+                updated_at: 0,
+                version: 1,
+              },
+            ],
+          }),
+      }),
+      'owner',
+    )
+
+    stubRoutedFetch(
+      baseRoutes({
+        [FIELD_DEFS]: () =>
+          jsonResponse(200, {
+            custom_field_defs: [
+              {
+                id: 'f1',
+                name: 'Color',
+                field_type: 'text',
+                display_order: 0,
+                created_at: 0,
+                updated_at: 0,
+                version: 1,
+              },
+            ],
+          }),
+        ['PUT /api/v1/custom-field-defs/f1']: () =>
+          jsonResponse(409, { title: 'Conflict', status: 409 }),
+      }),
+    )
+
+    const card = fieldDefsCard(wrapper)
+    await card
+      .findAll('button')
+      .find((b) => b.text() === 'Rename')!
+      .trigger('click')
+    await wrapper.vm.$nextTick()
+    await card.get('form').trigger('submit')
+    await flush()
+    await wrapper.vm.$nextTick()
+
+    expect(card.get('[role="alert"]').text()).toContain('Someone else changed this definition')
+    expect(card.findAll('.settings__row')).toHaveLength(1)
+    expect((card.get('[aria-label="Name"]').element as HTMLInputElement).value).toBe('Color')
+  })
+
+  it('deletes a definition after confirmation, removing exactly that row', async () => {
+    vi.stubGlobal(
+      'confirm',
+      vi.fn(() => true),
+    )
+    const { wrapper, fetchMock } = await mountSettings(
+      baseRoutes({
+        [FIELD_DEFS]: () =>
+          jsonResponse(200, {
+            custom_field_defs: [
+              {
+                id: 'f1',
+                name: 'Color',
+                field_type: 'text',
+                display_order: 0,
+                created_at: 0,
+                updated_at: 0,
+                version: 1,
+              },
+            ],
+          }),
+        ['DELETE /api/v1/custom-field-defs/f1']: () => jsonResponse(204),
+      }),
+      'owner',
+    )
+
+    const card = fieldDefsCard(wrapper)
+    await card
+      .findAll('button')
+      .find((b) => b.text() === 'Delete')!
+      .trigger('click')
+    await flush()
+    await wrapper.vm.$nextTick()
+
+    expect(card.find('.settings__row').exists()).toBe(false)
+    expect(
+      fetchMock.mock.calls.some(
+        ([input, init]) => input === '/api/v1/custom-field-defs/f1' && init?.method === 'DELETE',
+      ),
+    ).toBe(true)
   })
 })

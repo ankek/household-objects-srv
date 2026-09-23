@@ -13,6 +13,7 @@ type PushMutation struct {
 	EntityID    string
 	BaseVersion int64
 	Fields      map[string]json.RawMessage
+	Op          string
 }
 
 type PushBatch struct {
@@ -45,13 +46,25 @@ type PushResult struct {
 	NewWatermark int64
 }
 
+type PushMutationError struct {
+	Index      int
+	MutationID string
+	Err        error
+}
+
+func (e *PushMutationError) Error() string {
+	return fmt.Sprintf("sync: push: mutation[%d] %q: %v", e.Index, e.MutationID, e.Err)
+}
+
+func (e *PushMutationError) Unwrap() error { return e.Err }
+
 func Push(ctx context.Context, commit storage.PushCommitRepository, batch PushBatch) (PushResult, error) {
 	if commit == nil {
 		return PushResult{}, fmt.Errorf("%w", ErrNoRepository)
 	}
 
 	var result PushResult
-	for _, m := range batch.Mutations {
+	for i, m := range batch.Mutations {
 		outcome, err := commit.ApplyMutation(ctx, storage.PushMutation{
 			MutationID:  m.MutationID,
 			EntityType:  m.EntityType,
@@ -59,9 +72,13 @@ func Push(ctx context.Context, commit storage.PushCommitRepository, batch PushBa
 			BaseVersion: m.BaseVersion,
 			Fields:      m.Fields,
 			Now:         batch.Now,
+			Op:          storage.PushOp(m.Op),
 		})
 		if err != nil {
-			return PushResult{}, fmt.Errorf("sync: push: mutation %q: %w", m.MutationID, err)
+			if storage.IsPushStructuralError(err) {
+				return PushResult{}, &PushMutationError{Index: i, MutationID: m.MutationID, Err: err}
+			}
+			return PushResult{}, fmt.Errorf("sync: push: mutation[%d] %q: %w", i, m.MutationID, err)
 		}
 
 		if outcome.Skipped {

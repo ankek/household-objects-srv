@@ -170,6 +170,8 @@ func mountV1(r chi.Router, cfg Config) {
 			r.Delete("/auth/device-tokens/{deviceTokenID}", deviceTokenRevokeHandler(cfg))
 		}
 
+		r.Get("/auth/me", middleware.Scoped(authMeHandler(cfg)))
+
 		if cfg.InviteService != nil && cfg.Invites != nil {
 			r.Group(func(r chi.Router) {
 				r.Use(middleware.RequireOwner(cfg.Logger))
@@ -274,7 +276,7 @@ func mountV1(r chi.Router, cfg Config) {
 
 		r.Route("/sync", func(r chi.Router) {
 			r.Post("/pull", middleware.Scoped(syncPullHandler(cfg)))
-			r.Post("/push", syncPushHandler(cfg))
+			r.Post("/push", middleware.Scoped(syncPushHandler(cfg)))
 		})
 	})
 

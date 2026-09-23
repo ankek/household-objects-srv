@@ -67,12 +67,22 @@ func (r stockAdjustmentRepository) Create(ctx context.Context, p CreateStockAdju
 
 	var created StockAdjustment
 	err := r.writeTx(ctx, func(tx *sql.Tx, q *gen.Queries) error {
+		before, beforeErr := q.GetItem(ctx, gen.GetItemParams{GroupID: r.group(), ItemID: p.ItemID})
+
 		row, err := createStockAdjustmentTx(ctx, tx, q, r.group(), p)
 		if err != nil {
 			return err
 		}
 		created = row
-		return nil
+
+		if beforeErr != nil {
+			return fmt.Errorf("storage: item %q: field-version diff pre-read: %w", p.ItemID, beforeErr)
+		}
+		after, err := q.GetItem(ctx, gen.GetItemParams{GroupID: r.group(), ItemID: p.ItemID})
+		if err != nil {
+			return fmt.Errorf("storage: item %q: field-version diff post-read: %w", p.ItemID, err)
+		}
+		return recordFieldVersionsTx(ctx, q, r.group(), "item", after.ID, after.Version, p.Now, diffItemFieldVersions(before, after))
 	})
 	if err != nil {
 		return StockAdjustment{}, err

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { ApiError } from '@/api'
 import { useSessionStore } from '@/stores'
 
@@ -123,6 +123,10 @@ async function submit(): Promise<void> {
       </button>
     </form>
 
+    <p class="muted login__join">
+      Have an invite? <RouterLink to="/join">Join a household</RouterLink>.
+    </p>
+
     <p class="muted login__note">
       Reaching this over plain HTTP from another machine? Sign-in needs either
       <code>localhost</code> or HTTPS — the session cookie is marked <code>Secure</code>, and a
@@ -177,6 +181,11 @@ async function submit(): Promise<void> {
 .login__explain {
   margin: 0;
   font-size: 0.8125rem;
+}
+
+.login__join {
+  font-size: 0.8125rem;
+  margin-top: 1.5rem;
 }
 
 .login__note {

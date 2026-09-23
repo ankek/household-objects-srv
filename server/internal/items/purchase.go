@@ -87,6 +87,10 @@ func UpdatePurchase(ctx context.Context, repo storage.PurchaseRepository, req Up
 	})
 }
 
+func ValidatePurchaseDate(purchasedOn string) error {
+	return validatePurchaseDate(purchasedOn)
+}
+
 func validatePurchaseDate(purchasedOn string) error {
 	if purchasedOn == "" {
 		return nil

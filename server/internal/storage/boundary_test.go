@@ -96,6 +96,8 @@ var exportedAliasAllowlist = map[string]string{
 	"ImportSession":       "gen.ImportSession",
 	"ItemLabelAssignment": "gen.ItemLabel",
 	"MutationLedgerEntry": "gen.Mutation",
+	"FieldVersion":        "gen.FieldVersion",
+	"ConflictRecord":      "gen.Conflict",
 }
 
 func TestExportedSurfaceExposesNoDatabaseHandle(t *testing.T) {

@@ -83,6 +83,10 @@ func UpdateSale(ctx context.Context, repo storage.SaleRepository, req UpdateSale
 	})
 }
 
+func ValidateSaleDate(soldOn string) error {
+	return validateSaleDate(soldOn)
+}
+
 func validateSaleDate(soldOn string) error {
 	if soldOn == "" {
 		return nil

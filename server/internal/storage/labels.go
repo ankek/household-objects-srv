@@ -155,12 +155,18 @@ func (r labelRepository) Update(ctx context.Context, p UpdateLabelParams) (Label
 
 	var updated Label
 	err := r.writeTx(ctx, func(tx *sql.Tx, q *gen.Queries) error {
+		before, beforeErr := q.GetLabel(ctx, gen.GetLabelParams{GroupID: r.group(), ID: p.ID})
+
 		row, err := updateLabelTx(ctx, tx, q, r.group(), p)
 		if err != nil {
 			return err
 		}
 		updated = row
-		return nil
+
+		if beforeErr != nil {
+			return fmt.Errorf("storage: label %q: field-version diff pre-read: %w", p.ID, beforeErr)
+		}
+		return recordFieldVersionsTx(ctx, q, r.group(), "label", row.ID, row.Version, p.Now, diffLabelFieldVersions(before, row))
 	})
 	if err != nil {
 		return Label{}, err

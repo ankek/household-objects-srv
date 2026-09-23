@@ -170,12 +170,18 @@ func (r identificationRepository) Update(ctx context.Context, p UpdateIdentifica
 
 	var updated Identification
 	err := r.writeTx(ctx, func(tx *sql.Tx, q *gen.Queries) error {
+		before, beforeErr := q.GetItemIdentification(ctx, gen.GetItemIdentificationParams{GroupID: r.group(), ItemID: p.ItemID, ID: p.ID})
+
 		row, err := updateIdentificationTx(ctx, tx, q, r.group(), p)
 		if err != nil {
 			return err
 		}
 		updated = row
-		return nil
+
+		if beforeErr != nil {
+			return fmt.Errorf("storage: identification %q on item %q: field-version diff pre-read: %w", p.ID, p.ItemID, beforeErr)
+		}
+		return recordFieldVersionsTx(ctx, q, r.group(), "item_identification", row.ID, row.Version, p.Now, diffIdentificationFieldVersions(before, row))
 	})
 	if err != nil {
 		return Identification{}, err

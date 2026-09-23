@@ -163,29 +163,33 @@ func (r itemLabelRepository) Detach(ctx context.Context, itemID, labelID string,
 	}
 
 	return r.writeTx(ctx, func(tx *sql.Tx, q *gen.Queries) error {
-		seq, err := db.AllocChangeSeq(ctx, tx, r.group())
-		if err != nil {
-			return fmt.Errorf("storage: allocate change_seq for label detach: %w", err)
-		}
-
-		rows, err := q.DeleteItemLabel(ctx, gen.DeleteItemLabelParams{
-			DeletedAt: sql.NullInt64{Int64: now, Valid: true},
-			Now:       now,
-			ChangeSeq: seq,
-			GroupID:   r.group(),
-			ItemID:    itemID,
-			LabelID:   labelID,
-		})
-		if err != nil {
-			return fmt.Errorf("storage: detach label %q from item %q: %w", labelID, itemID, err)
-		}
-		switch {
-		case rows == 0:
-			return fmt.Errorf("storage: label %q on item %q: %w", labelID, itemID, ErrNotFound)
-		case rows != 1:
-			return fmt.Errorf("storage: detach label %q from item %q: matched %d rows, want 1; ux_item_labels_group_item_label makes (group_id, item_id, label_id) unique among live rows, so this is reachable only if a predicate was lost from DeleteItemLabel -- see this method's own doc",
-				labelID, itemID, rows)
-		}
-		return nil
+		return detachItemLabelTx(ctx, tx, q, r.group(), itemID, labelID, now)
 	})
+}
+
+func detachItemLabelTx(ctx context.Context, tx *sql.Tx, q *gen.Queries, group, itemID, labelID string, now int64) error {
+	seq, err := db.AllocChangeSeq(ctx, tx, group)
+	if err != nil {
+		return fmt.Errorf("storage: allocate change_seq for label detach: %w", err)
+	}
+
+	rows, err := q.DeleteItemLabel(ctx, gen.DeleteItemLabelParams{
+		DeletedAt: sql.NullInt64{Int64: now, Valid: true},
+		Now:       now,
+		ChangeSeq: seq,
+		GroupID:   group,
+		ItemID:    itemID,
+		LabelID:   labelID,
+	})
+	if err != nil {
+		return fmt.Errorf("storage: detach label %q from item %q: %w", labelID, itemID, err)
+	}
+	switch {
+	case rows == 0:
+		return fmt.Errorf("storage: label %q on item %q: %w", labelID, itemID, ErrNotFound)
+	case rows != 1:
+		return fmt.Errorf("storage: detach label %q from item %q: matched %d rows, want 1; ux_item_labels_group_item_label makes (group_id, item_id, label_id) unique among live rows, so this is reachable only if a predicate was lost from DeleteItemLabel -- see this method's own doc",
+			labelID, itemID, rows)
+	}
+	return nil
 }

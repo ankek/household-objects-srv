@@ -15,6 +15,12 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/views/LoginView.vue'),
     meta: { public: true },
   },
+  {
+    path: '/join',
+    name: 'join',
+    component: () => import('@/views/JoinView.vue'),
+    meta: { public: true },
+  },
   { path: '/items', name: 'items', component: ItemsView },
   {
     path: '/items/new',
@@ -39,6 +45,16 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/views/LabelSheetView.vue'),
   },
   {
+    path: '/import',
+    name: 'import',
+    component: () => import('@/views/ImportView.vue'),
+  },
+  {
+    path: '/reports',
+    name: 'reports',
+    component: () => import('@/views/ReportsView.vue'),
+  },
+  {
     path: '/settings',
     name: 'settings',
     component: () => import('@/views/SettingsView.vue'),
@@ -56,7 +72,9 @@ const authGuard: NavigationGuard = async (to) => {
   await session.boot()
 
   if (to.meta.public === true) {
-    if (to.name === 'login' && session.isAuthenticated) return { path: '/items' }
+    if ((to.name === 'login' || to.name === 'join') && session.isAuthenticated) {
+      return { path: '/items' }
+    }
     return true
   }
 

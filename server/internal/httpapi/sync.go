@@ -1,16 +1,20 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/ankek/Household-Objects-Dev/server/internal/httpapi/middleware"
 	"github.com/ankek/Household-Objects-Dev/server/internal/httpapi/problem"
 	"github.com/ankek/Household-Objects-Dev/server/internal/httpapi/requestid"
+	"github.com/ankek/Household-Objects-Dev/server/internal/items"
+	"github.com/ankek/Household-Objects-Dev/server/internal/labels"
 	"github.com/ankek/Household-Objects-Dev/server/internal/storage"
 	syncpkg "github.com/ankek/Household-Objects-Dev/server/internal/sync"
 	"log/slog"
 	"net/http"
+	"time"
 )
 
 const maxSyncPullLimit = 500
@@ -240,8 +244,252 @@ func syncPullHandler(cfg Config) middleware.ScopedHandler {
 	}
 }
 
-func syncPushHandler(cfg Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		problem.Write(w, r, problem.NotImplemented())
+type syncPushMutationBody struct {
+	MutationID  string                     `json:"mutation_id"`
+	EntityType  string                     `json:"entity_type"`
+	EntityID    string                     `json:"entity_id"`
+	BaseVersion int64                      `json:"base_version"`
+	Fields      map[string]json.RawMessage `json:"fields"`
+	Op          string                     `json:"op,omitempty"`
+}
+
+type syncPushRequestBody struct {
+	DeviceID  string                 `json:"device_id"`
+	Mutations []syncPushMutationBody `json:"mutations"`
+}
+
+type syncPushAppliedEntryBody struct {
+	MutationID string `json:"mutation_id"`
+	EntityType string `json:"entity_type"`
+	EntityID   string `json:"entity_id"`
+	Version    int64  `json:"version"`
+}
+
+type syncPushSkippedEntryBody struct {
+	MutationID string `json:"mutation_id"`
+}
+
+type syncPushConflictEntryBody struct {
+	MutationID string `json:"mutation_id"`
+	EntityType string `json:"entity_type"`
+	EntityID   string `json:"entity_id"`
+	FieldName  string `json:"field_name"`
+}
+
+type syncPushResponseBody struct {
+	Applied      []syncPushAppliedEntryBody  `json:"applied"`
+	Skipped      []syncPushSkippedEntryBody  `json:"skipped"`
+	Conflicts    []syncPushConflictEntryBody `json:"conflicts"`
+	NewWatermark int64                       `json:"new_watermark"`
+}
+
+func toSyncPushResponseBody(result syncpkg.PushResult) syncPushResponseBody {
+	applied := make([]syncPushAppliedEntryBody, 0, len(result.Applied))
+	for _, a := range result.Applied {
+		applied = append(applied, syncPushAppliedEntryBody{
+			MutationID: a.MutationID,
+			EntityType: a.EntityType,
+			EntityID:   a.EntityID,
+			Version:    a.Version,
+		})
+	}
+
+	skipped := make([]syncPushSkippedEntryBody, 0, len(result.Skipped))
+	for _, s := range result.Skipped {
+		skipped = append(skipped, syncPushSkippedEntryBody{MutationID: s.MutationID})
+	}
+
+	conflicts := make([]syncPushConflictEntryBody, 0, len(result.Conflicts))
+	for _, c := range result.Conflicts {
+		conflicts = append(conflicts, syncPushConflictEntryBody{
+			MutationID: c.MutationID,
+			EntityType: c.EntityType,
+			EntityID:   c.EntityID,
+			FieldName:  c.FieldName,
+		})
+	}
+
+	return syncPushResponseBody{
+		Applied:      applied,
+		Skipped:      skipped,
+		Conflicts:    conflicts,
+		NewWatermark: result.NewWatermark,
+	}
+}
+
+var syncPushCommitRepositoryFor = func(cfg Config, scope storage.Scope) (storage.PushCommitRepository, error) {
+	if cfg.Store == nil {
+		return nil, errors.New("httpapi: sync: no storage configured")
+	}
+	return cfg.Store.ForGroupPushCommit(scope.GroupID())
+}
+
+func pushMutationDetail(index int, mutationID, reason string) string {
+	return fmt.Sprintf("mutations[%d] (mutation_id=%q): %s", index, mutationID, reason)
+}
+
+func syncPushFieldString(fields map[string]json.RawMessage, name string) (string, bool, error) {
+	raw, ok := fields[name]
+	if !ok {
+		return "", false, nil
+	}
+	var v string
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return "", true, fmt.Errorf("field %q does not decode to a string", name)
+	}
+	return v, true, nil
+}
+
+func validatePushMutationFields(ctx context.Context, scope storage.Scope, m syncPushMutationBody) error {
+	switch m.EntityType {
+	case "item_identification":
+		kind, present, err := syncPushFieldString(m.Fields, "kind")
+		if err != nil {
+			return err
+		}
+		if present {
+			if err := items.ValidateIdentificationKind(kind); err != nil {
+				return err
+			}
+		}
+
+	case "warranty_block":
+		startsOn, _, err := syncPushFieldString(m.Fields, "starts_on")
+		if err != nil {
+			return err
+		}
+		expiresOn, _, err := syncPushFieldString(m.Fields, "expires_on")
+		if err != nil {
+			return err
+		}
+		if err := items.ValidateWarrantyDates(startsOn, expiresOn); err != nil {
+			return err
+		}
+
+	case "sold_to_block":
+		soldOn, _, err := syncPushFieldString(m.Fields, "sold_on")
+		if err != nil {
+			return err
+		}
+		if err := items.ValidateSaleDate(soldOn); err != nil {
+			return err
+		}
+
+	case "purchased_from_block":
+		purchasedOn, _, err := syncPushFieldString(m.Fields, "purchased_on")
+		if err != nil {
+			return err
+		}
+		if err := items.ValidatePurchaseDate(purchasedOn); err != nil {
+			return err
+		}
+
+	case "item_custom_field":
+		fieldType, hasType, err := syncPushFieldString(m.Fields, "field_type")
+		if err != nil {
+			return err
+		}
+		if hasType {
+			if err := items.ValidateCustomFieldType(fieldType); err != nil {
+				return err
+			}
+		}
+		fieldDefID, hasDef, err := syncPushFieldString(m.Fields, "field_def_id")
+		if err != nil {
+			return err
+		}
+		if hasDef && fieldDefID != "" && hasType {
+			if err := items.ResolveCustomFieldDef(ctx, scope.CustomFieldDefs(), fieldDefID, fieldType); err != nil {
+				return err
+			}
+		}
+
+	case "label":
+		color, present, err := syncPushFieldString(m.Fields, "color")
+		if err != nil {
+			return err
+		}
+		if present {
+			if err := labels.ValidateColor(color); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func syncPushHandler(cfg Config) middleware.ScopedHandler {
+	return func(w http.ResponseWriter, r *http.Request, scope storage.Scope) {
+		var body syncPushRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			problem.Write(w, r, problem.BadRequest("the request body is not valid JSON"))
+			return
+		}
+		if body.DeviceID == "" {
+			problem.Write(w, r, problem.BadRequest("device_id is required"))
+			return
+		}
+
+		batch := syncpkg.PushBatch{
+			Mutations: make([]syncpkg.PushMutation, 0, len(body.Mutations)),
+			Now:       time.Now().UnixMilli(),
+		}
+		for i, m := range body.Mutations {
+			switch {
+			case m.MutationID == "":
+				problem.Write(w, r, problem.BadRequest(pushMutationDetail(i, m.MutationID, "mutation_id is required")))
+				return
+			case m.EntityType == "":
+				problem.Write(w, r, problem.BadRequest(pushMutationDetail(i, m.MutationID, "entity_type is required")))
+				return
+			case m.EntityID == "":
+				problem.Write(w, r, problem.BadRequest(pushMutationDetail(i, m.MutationID, "entity_id is required")))
+				return
+			case m.BaseVersion < 0:
+				problem.Write(w, r, problem.BadRequest(pushMutationDetail(i, m.MutationID, "base_version must not be negative")))
+				return
+			}
+
+			if err := validatePushMutationFields(r.Context(), scope, m); err != nil {
+				problem.Write(w, r, problem.BadRequest(pushMutationDetail(i, m.MutationID, err.Error())))
+				return
+			}
+
+			batch.Mutations = append(batch.Mutations, syncpkg.PushMutation{
+				MutationID:  m.MutationID,
+				EntityType:  m.EntityType,
+				EntityID:    m.EntityID,
+				BaseVersion: m.BaseVersion,
+				Fields:      m.Fields,
+				Op:          m.Op,
+			})
+		}
+
+		commit, err := syncPushCommitRepositoryFor(cfg, scope)
+		if err != nil {
+			cfg.Logger.LogAttrs(r.Context(), slog.LevelError, "sync: push: bind push commit repository failed",
+				slog.String("request_id", requestid.FromContext(r.Context())),
+				slog.String("error", err.Error()),
+			)
+			problem.Write(w, r, problem.Internal())
+			return
+		}
+
+		result, err := syncpkg.Push(r.Context(), commit, batch)
+		if err != nil {
+			var mutationErr *syncpkg.PushMutationError
+			if errors.As(err, &mutationErr) {
+				problem.Write(w, r, problem.BadRequest(pushMutationDetail(mutationErr.Index, mutationErr.MutationID, mutationErr.Err.Error())))
+				return
+			}
+			cfg.Logger.LogAttrs(r.Context(), slog.LevelError, "sync: push failed",
+				slog.String("request_id", requestid.FromContext(r.Context())),
+				slog.String("error", err.Error()),
+			)
+			problem.Write(w, r, problem.Internal())
+			return
+		}
+
+		writeJSON(w, r, http.StatusOK, toSyncPushResponseBody(result))
 	}
 }

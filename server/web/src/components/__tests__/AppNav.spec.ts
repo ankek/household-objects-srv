@@ -14,14 +14,16 @@ beforeEach(() => {
   router = createAppRouter()
   vi.stubGlobal(
     'fetch',
-    vi.fn<typeof fetch>().mockImplementation(() =>
-      Promise.resolve(
-        new Response(JSON.stringify({ sessions: [] }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        }),
+    vi
+      .fn<typeof fetch>()
+      .mockImplementation(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({ group_id: 'g', user_id: 'u', username: 'anton', role: 'owner' }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          ),
+        ),
       ),
-    ),
   )
 })
 
@@ -57,6 +59,8 @@ describe('AppNav', () => {
       'Locations',
       'Labels',
       'Print labels',
+      'Import',
+      'Reports',
       'Settings',
     ])
     expect(links.map((link) => link.attributes('href'))).toEqual([
@@ -64,6 +68,8 @@ describe('AppNav', () => {
       '/locations',
       '/labels',
       '/print-labels',
+      '/import',
+      '/reports',
       '/settings',
     ])
     expect(links.map((link) => router.resolve(link.attributes('href')!).name)).toEqual([
@@ -71,6 +77,8 @@ describe('AppNav', () => {
       'locations',
       'labels',
       'print-labels',
+      'import',
+      'reports',
       'settings',
     ])
   })
@@ -95,6 +103,7 @@ describe('AppNav', () => {
     const session = useSessionStore()
 
     session.status = 'authenticated'
+    session.user = null
     await wrapper.vm.$nextTick()
     expect(wrapper.find('.app-nav__user').exists()).toBe(false)
     expect(wrapper.text()).toContain('Sign out')

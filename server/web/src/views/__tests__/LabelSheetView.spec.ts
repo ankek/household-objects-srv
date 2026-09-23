@@ -276,6 +276,157 @@ describe('LabelSheetView sheet generation', () => {
   })
 })
 
+describe('LabelSheetView preset geometry', () => {
+  it('sets the sheet grid geometry from the chosen preset, and updates it when the preset changes', async () => {
+    const batchItems = [{ id: 'a', short_code: 'AAA', name: 'Drill', qr_svg: '<svg></svg>' }]
+    const { wrapper } = await mountSheet(
+      baseRoutes({
+        [`GET /api/v1/items?limit=${PAGE_SIZE}&offset=0`]: () =>
+          jsonResponse(200, { items: [item({ id: 'a', name: 'Drill' })] }),
+        [BATCH]: () => jsonResponse(200, { items: batchItems }),
+      }),
+    )
+
+    await toggleRow(wrapper, 'Drill')
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text() === 'Generate sheet')!
+      .trigger('click')
+    await flush()
+    await wrapper.vm.$nextTick()
+
+    const style5160 = wrapper.get('.sheet').attributes('style')!
+    expect(style5160).toContain('--sheet-columns: 3')
+    expect(style5160).toContain('--sheet-rows: 10')
+    expect(style5160).toContain('--cell-w: 2.625in')
+    expect(style5160).toContain('--cell-h: 1in')
+
+    await wrapper.get('#label-preset').setValue('avery-5163')
+    await wrapper.vm.$nextTick()
+
+    const style5163 = wrapper.get('.sheet').attributes('style')!
+    expect(style5163).toContain('--sheet-columns: 2')
+    expect(style5163).toContain('--sheet-rows: 5')
+    expect(style5163).toContain('--cell-w: 4in')
+    expect(style5163).toContain('--cell-h: 2in')
+  })
+
+  it('chunks one item over the 30-per-sheet 5160 boundary into a second, single-item sheet', async () => {
+    const thirtyOne = Array.from({ length: 31 }, (_, i) => item({ id: `i${i}`, name: `Item ${i}` }))
+    const batchItems = thirtyOne.map((it) => ({
+      id: it.id,
+      short_code: `CODE${it.id}`,
+      name: it.name,
+      qr_svg: `<svg data-test="qr-${it.id}"></svg>`,
+    }))
+
+    const { wrapper } = await mountSheet(
+      baseRoutes({
+        [`GET /api/v1/items?limit=${PAGE_SIZE}&offset=0`]: () =>
+          jsonResponse(200, { items: thirtyOne }),
+        [BATCH]: () => jsonResponse(200, { items: batchItems }),
+      }),
+    )
+
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text() === 'Select page')!
+      .trigger('click')
+    expect(selectionSummary(wrapper)).toContain('31 selected')
+
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text() === 'Generate sheet')!
+      .trigger('click')
+    await flush()
+    await wrapper.vm.$nextTick()
+
+    const sheets = wrapper.findAll('.sheet')
+    expect(sheets).toHaveLength(2)
+    expect(sheets[0]!.findAll('.sheet__cell')).toHaveLength(30)
+    expect(sheets[1]!.findAll('.sheet__cell')).toHaveLength(1)
+    expect(sheets[1]!.find('.sheet__cell').text()).toContain('Item 30')
+  })
+})
+
+describe('LabelSheetView batch request count and print', () => {
+  it('issues exactly one batch request per Generate click', async () => {
+    const { wrapper, fetchMock } = await mountSheet(
+      baseRoutes({
+        [`GET /api/v1/items?limit=${PAGE_SIZE}&offset=0`]: () =>
+          jsonResponse(200, { items: [item({ id: 'a', name: 'Drill' })] }),
+        [BATCH]: () =>
+          jsonResponse(200, {
+            items: [{ id: 'a', short_code: 'AAA', name: 'Drill', qr_svg: '<svg></svg>' }],
+          }),
+      }),
+    )
+
+    await toggleRow(wrapper, 'Drill')
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text() === 'Generate sheet')!
+      .trigger('click')
+    await flush()
+    await wrapper.vm.$nextTick()
+
+    const batchCalls = fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')
+    expect(batchCalls).toHaveLength(1)
+  })
+
+  it('Print stays disabled until a sheet exists, then calls window.print', async () => {
+    const printSpy = vi.fn()
+    vi.stubGlobal('print', printSpy)
+
+    const { wrapper } = await mountSheet(
+      baseRoutes({
+        [`GET /api/v1/items?limit=${PAGE_SIZE}&offset=0`]: () =>
+          jsonResponse(200, { items: [item({ id: 'a', name: 'Drill' })] }),
+        [BATCH]: () =>
+          jsonResponse(200, {
+            items: [{ id: 'a', short_code: 'AAA', name: 'Drill', qr_svg: '<svg></svg>' }],
+          }),
+      }),
+    )
+
+    const printButton = () => wrapper.findAll('button').find((b) => b.text() === 'Print')!
+    expect(printButton().attributes('disabled')).toBeDefined()
+
+    await toggleRow(wrapper, 'Drill')
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text() === 'Generate sheet')!
+      .trigger('click')
+    await flush()
+    await wrapper.vm.$nextTick()
+
+    expect(printButton().attributes('disabled')).toBeUndefined()
+    await printButton().trigger('click')
+    expect(printSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows the server error and no sheet when Generate sheet fails', async () => {
+    const { wrapper } = await mountSheet(
+      baseRoutes({
+        [`GET /api/v1/items?limit=${PAGE_SIZE}&offset=0`]: () =>
+          jsonResponse(200, { items: [item({ id: 'a', name: 'Drill' })] }),
+        [BATCH]: () => jsonResponse(500, { title: 'Internal Server Error' }),
+      }),
+    )
+
+    await toggleRow(wrapper, 'Drill')
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text() === 'Generate sheet')!
+      .trigger('click')
+    await flush()
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.get('.alert').text()).toContain('Internal Server Error')
+    expect(wrapper.find('.sheet').exists()).toBe(false)
+  })
+})
+
 describe('LabelSheetView batch-size ceiling', () => {
   it('disables Generate and explains why once the selection passes 200, the batch endpoint’s own ceiling', async () => {
     const page = (offset: number, count: number) =>

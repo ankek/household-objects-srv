@@ -160,12 +160,18 @@ func (r saleRepository) Update(ctx context.Context, p UpdateSaleParams) (Sale, e
 
 	var updated Sale
 	err := r.writeTx(ctx, func(tx *sql.Tx, q *gen.Queries) error {
+		before, beforeErr := q.GetItemSale(ctx, gen.GetItemSaleParams{GroupID: r.group(), ItemID: p.ItemID})
+
 		row, err := updateSaleTx(ctx, tx, q, r.group(), p)
 		if err != nil {
 			return err
 		}
 		updated = row
-		return nil
+
+		if beforeErr != nil {
+			return fmt.Errorf("storage: sale for item %q: field-version diff pre-read: %w", p.ItemID, beforeErr)
+		}
+		return recordFieldVersionsTx(ctx, q, r.group(), "sold_to_block", row.ID, row.Version, p.Now, diffSaleFieldVersions(before, row))
 	})
 	if err != nil {
 		return Sale{}, err

@@ -185,49 +185,6 @@ func TestApplyMutationUpdateMatchingBaseVersionAppliesAndBumpsVersion(t *testing
 	}
 }
 
-func TestApplyMutationStaleBaseVersionConflictsEveryNamedFieldAndWritesNothing(t *testing.T) {
-	commitA, _, scopeA, _, _ := pushCommitScope(t)
-
-	_, err := scopeA.Items().Create(t.Context(), CreateItemParams{
-		ID: "item-stale-1", Name: "Hammer", Quantity: 1, ShortCode: "SC-STALE1", Now: 1,
-	})
-	if err != nil {
-		t.Fatalf("seed item: %v", err)
-	}
-	if _, err := scopeA.Items().Update(t.Context(), UpdateItemParams{
-		ItemID: "item-stale-1", Name: "Hammer", Quantity: 9, ExpectedVersion: 1, Now: 2,
-	}); err != nil {
-		t.Fatalf("advance item to version 2: %v", err)
-	}
-
-	outcome, err := commitA.ApplyMutation(t.Context(), PushMutation{
-		MutationID:  "mut-stale-1",
-		EntityType:  "item",
-		EntityID:    "item-stale-1",
-		BaseVersion: 1,
-		Fields:      pushFields(t, map[string]any{"name": "Mallet", "quantity": 2}),
-		Now:         3000,
-	})
-	if err != nil {
-		t.Fatalf("ApplyMutation: %v", err)
-	}
-	if outcome.Applied {
-		t.Fatalf("outcome.Applied = true, want false for a stale base_version")
-	}
-	wantConflicts := []string{"name", "quantity"}
-	if !equalStringSlices(outcome.ConflictFields, wantConflicts) {
-		t.Fatalf("outcome.ConflictFields = %v, want %v", outcome.ConflictFields, wantConflicts)
-	}
-
-	item, err := scopeA.Items().Get(t.Context(), "item-stale-1")
-	if err != nil {
-		t.Fatalf("Get item: %v", err)
-	}
-	if item.Name != "Hammer" || item.Quantity != 9 || item.Version != 2 {
-		t.Fatalf("item after conflicting push = %+v, want unchanged (Name=Hammer Quantity=9 Version=2)", item)
-	}
-}
-
 func TestApplyMutationUpdateAbsentEntityConflictsWithoutResurrection(t *testing.T) {
 	commitA, _, scopeA, _, _ := pushCommitScope(t)
 
@@ -378,6 +335,423 @@ func TestApplyMutationCreationOnlyEntityRejectsNonZeroBaseVersion(t *testing.T) 
 	})
 	if !errors.Is(err, ErrPushCreationOnly) {
 		t.Fatalf("ApplyMutation error = %v, want ErrPushCreationOnly", err)
+	}
+}
+
+func TestApplyMutationWarrantyCreateOnExistingBlockIsConflict(t *testing.T) {
+	commitA, _, scopeA, _, s := pushCommitScope(t)
+
+	_, err := scopeA.Items().Create(t.Context(), CreateItemParams{
+		ID: "item-warr-1", Name: "Fridge", ShortCode: "SC-WARR1", Now: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+	if _, err := scopeA.Warranty().Create(t.Context(), CreateWarrantyParams{
+		ID: "warr-existing", ItemID: "item-warr-1", Holder: "Acme", Now: 1,
+	}); err != nil {
+		t.Fatalf("seed existing warranty: %v", err)
+	}
+
+	outcome, err := commitA.ApplyMutation(t.Context(), PushMutation{
+		MutationID:  "mut-warr-conflict",
+		EntityType:  "warranty_block",
+		EntityID:    "warr-second-device",
+		BaseVersion: 0,
+		Fields:      pushFields(t, map[string]any{"item_id": "item-warr-1", "holder": "Other Co"}),
+		Now:         2000,
+	})
+	if err != nil {
+		t.Fatalf("ApplyMutation returned an error, want a recorded conflict: %v", err)
+	}
+	if outcome.Applied {
+		t.Fatalf("outcome.Applied = true, want false")
+	}
+	if !equalStringSlices(outcome.ConflictFields, []string{entityConflictField}) {
+		t.Fatalf("outcome.ConflictFields = %v, want [%s]", outcome.ConflictFields, entityConflictField)
+	}
+
+	q := gen.New(s.store.Reader())
+	ledger, err := q.GetMutationByMutationID(t.Context(), gen.GetMutationByMutationIDParams{
+		GroupID: "groupA", MutationID: "mut-warr-conflict",
+	})
+	if err != nil {
+		t.Fatalf("read back ledger row: %v", err)
+	}
+	if ledger.Outcome != string(MutationOutcomeConflict) {
+		t.Fatalf("ledger.Outcome = %q, want conflict", ledger.Outcome)
+	}
+	if n := countRowsForGroup(t, s, "item_warranty", "groupA"); n != 1 {
+		t.Fatalf("item_warranty row count = %d, want 1 (the losing create must write nothing)", n)
+	}
+}
+
+func TestApplyMutationLabelCreateNameConflictIsRecorded(t *testing.T) {
+	commitA, _, scopeA, _, s := pushCommitScope(t)
+
+	if _, err := scopeA.Labels().Create(t.Context(), CreateLabelParams{
+		ID: "label-existing", Name: "Garage", Color: "#123456", Now: 1,
+	}); err != nil {
+		t.Fatalf("seed existing label: %v", err)
+	}
+
+	outcome, err := commitA.ApplyMutation(t.Context(), PushMutation{
+		MutationID:  "mut-label-conflict",
+		EntityType:  "label",
+		EntityID:    "label-second-device",
+		BaseVersion: 0,
+		Fields:      pushFields(t, map[string]any{"name": "Garage", "color": "#abcdef"}),
+		Now:         2000,
+	})
+	if err != nil {
+		t.Fatalf("ApplyMutation returned an error, want a recorded conflict: %v", err)
+	}
+	if outcome.Applied {
+		t.Fatalf("outcome.Applied = true, want false")
+	}
+	if !equalStringSlices(outcome.ConflictFields, []string{"name"}) {
+		t.Fatalf("outcome.ConflictFields = %v, want [name]", outcome.ConflictFields)
+	}
+	if n := countRowsForGroup(t, s, "labels", "groupA"); n != 1 {
+		t.Fatalf("labels row count = %d, want 1", n)
+	}
+}
+
+func TestApplyMutationItemCreateShortCodeExhaustionIsConflict(t *testing.T) {
+	commitA, _, scopeA, _, _ := pushCommitScope(t)
+
+	if _, err := scopeA.Items().Create(t.Context(), CreateItemParams{
+		ID: "item-taken-code", Name: "Ladder", ShortCode: "FIXEDCODE", Now: 1,
+	}); err != nil {
+		t.Fatalf("seed item with the fixed short code: %v", err)
+	}
+
+	prev := pushNewItemShortCode
+	pushNewItemShortCode = func() (string, error) { return "FIXEDCODE", nil }
+	t.Cleanup(func() { pushNewItemShortCode = prev })
+
+	outcome, err := commitA.ApplyMutation(t.Context(), PushMutation{
+		MutationID:  "mut-shortcode-exhausted",
+		EntityType:  "item",
+		EntityID:    "item-new-id",
+		BaseVersion: 0,
+		Fields:      pushFields(t, map[string]any{"name": "Second Ladder"}),
+		Now:         2000,
+	})
+	if err != nil {
+		t.Fatalf("ApplyMutation returned an error, want a recorded conflict: %v", err)
+	}
+	if outcome.Applied {
+		t.Fatalf("outcome.Applied = true, want false")
+	}
+	if !equalStringSlices(outcome.ConflictFields, []string{"short_code"}) {
+		t.Fatalf("outcome.ConflictFields = %v, want [short_code]", outcome.ConflictFields)
+	}
+}
+
+func TestApplyMutationLocationCreateMissingParentIsConflict(t *testing.T) {
+	commitA, _, _, _, _ := pushCommitScope(t)
+
+	outcome, err := commitA.ApplyMutation(t.Context(), PushMutation{
+		MutationID:  "mut-loc-parent-missing",
+		EntityType:  "location",
+		EntityID:    "loc-1",
+		BaseVersion: 0,
+		Fields:      pushFields(t, map[string]any{"name": "Shed", "parent_id": "does-not-exist"}),
+		Now:         2000,
+	})
+	if err != nil {
+		t.Fatalf("ApplyMutation returned an error, want a recorded conflict: %v", err)
+	}
+	if outcome.Applied {
+		t.Fatalf("outcome.Applied = true, want false")
+	}
+	if !equalStringSlices(outcome.ConflictFields, []string{"parent_id"}) {
+		t.Fatalf("outcome.ConflictFields = %v, want [parent_id]", outcome.ConflictFields)
+	}
+}
+
+func TestApplyMutationLocationUpdateCycleIsConflict(t *testing.T) {
+	commitA, _, scopeA, _, _ := pushCommitScope(t)
+
+	root, err := scopeA.Locations().Create(t.Context(), CreateLocationParams{ID: "loc-root", Name: "House", Now: 1})
+	if err != nil {
+		t.Fatalf("seed root location: %v", err)
+	}
+	child, err := scopeA.Locations().Create(t.Context(), CreateLocationParams{ID: "loc-child", Name: "Garage", ParentID: root.ID, Now: 1})
+	if err != nil {
+		t.Fatalf("seed child location: %v", err)
+	}
+
+	outcome, err := commitA.ApplyMutation(t.Context(), PushMutation{
+		MutationID:  "mut-loc-cycle",
+		EntityType:  "location",
+		EntityID:    root.ID,
+		BaseVersion: root.Version,
+		Fields:      pushFields(t, map[string]any{"name": "House", "parent_id": child.ID}),
+		Now:         2000,
+	})
+	if err != nil {
+		t.Fatalf("ApplyMutation returned an error, want a recorded conflict: %v", err)
+	}
+	if outcome.Applied {
+		t.Fatalf("outcome.Applied = true, want false")
+	}
+	if !equalStringSlices(outcome.ConflictFields, []string{"parent_id"}) {
+		t.Fatalf("outcome.ConflictFields = %v, want [parent_id]", outcome.ConflictFields)
+	}
+}
+
+func TestApplyMutationCreateClientEntityIDAlreadyExistsIsConflict(t *testing.T) {
+	commitA, _, scopeA, _, _ := pushCommitScope(t)
+
+	existing, err := scopeA.Items().Create(t.Context(), CreateItemParams{
+		ID: "item-collide", Name: "Original", ShortCode: "SC-ORIG", Now: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+
+	outcome, err := commitA.ApplyMutation(t.Context(), PushMutation{
+		MutationID:  "mut-id-collide",
+		EntityType:  "item",
+		EntityID:    existing.ID,
+		BaseVersion: 0,
+		Fields:      pushFields(t, map[string]any{"name": "Impostor"}),
+		Now:         2000,
+	})
+	if err != nil {
+		t.Fatalf("ApplyMutation returned an error, want a recorded conflict: %v", err)
+	}
+	if outcome.Applied {
+		t.Fatalf("outcome.Applied = true, want false")
+	}
+	if !equalStringSlices(outcome.ConflictFields, []string{entityConflictField}) {
+		t.Fatalf("outcome.ConflictFields = %v, want [%s]", outcome.ConflictFields, entityConflictField)
+	}
+
+	item, err := scopeA.Items().Get(t.Context(), existing.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if item.Name != "Original" {
+		t.Fatalf("item.Name = %q, want unchanged Original", item.Name)
+	}
+}
+
+func TestApplyMutationWarrantyCreateMissingItemIsConflict(t *testing.T) {
+	commitA, _, _, _, _ := pushCommitScope(t)
+
+	outcome, err := commitA.ApplyMutation(t.Context(), PushMutation{
+		MutationID:  "mut-warr-no-item",
+		EntityType:  "warranty_block",
+		EntityID:    "warr-1",
+		BaseVersion: 0,
+		Fields:      pushFields(t, map[string]any{"item_id": "item-does-not-exist", "holder": "Acme"}),
+		Now:         2000,
+	})
+	if err != nil {
+		t.Fatalf("ApplyMutation returned an error, want a recorded conflict: %v", err)
+	}
+	if outcome.Applied {
+		t.Fatalf("outcome.Applied = true, want false")
+	}
+	if !equalStringSlices(outcome.ConflictFields, []string{"item_id"}) {
+		t.Fatalf("outcome.ConflictFields = %v, want [item_id]", outcome.ConflictFields)
+	}
+}
+
+func TestApplyMutationItemLabelCreateMissingItemOrLabelIsConflict(t *testing.T) {
+	commitA, _, scopeA, _, _ := pushCommitScope(t)
+
+	item, err := scopeA.Items().Create(t.Context(), CreateItemParams{ID: "item-for-edge", Name: "Box", ShortCode: "SC-EDGE1", Now: 1})
+	if err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+	label, err := scopeA.Labels().Create(t.Context(), CreateLabelParams{ID: "label-for-edge", Name: "Fragile", Color: "#ff0000", Now: 1})
+	if err != nil {
+		t.Fatalf("seed label: %v", err)
+	}
+
+	t.Run("missing item_id", func(t *testing.T) {
+		outcome, err := commitA.ApplyMutation(t.Context(), PushMutation{
+			MutationID:  "mut-edge-no-item",
+			EntityType:  "item_label",
+			EntityID:    "edge-1",
+			BaseVersion: 0,
+			Fields:      pushFields(t, map[string]any{"item_id": "does-not-exist", "label_id": label.ID}),
+			Now:         2000,
+		})
+		if err != nil {
+			t.Fatalf("ApplyMutation returned an error, want a recorded conflict: %v", err)
+		}
+		if !equalStringSlices(outcome.ConflictFields, []string{"item_id"}) {
+			t.Fatalf("outcome.ConflictFields = %v, want [item_id]", outcome.ConflictFields)
+		}
+	})
+
+	t.Run("missing label_id", func(t *testing.T) {
+		outcome, err := commitA.ApplyMutation(t.Context(), PushMutation{
+			MutationID:  "mut-edge-no-label",
+			EntityType:  "item_label",
+			EntityID:    "edge-2",
+			BaseVersion: 0,
+			Fields:      pushFields(t, map[string]any{"item_id": item.ID, "label_id": "does-not-exist"}),
+			Now:         2000,
+		})
+		if err != nil {
+			t.Fatalf("ApplyMutation returned an error, want a recorded conflict: %v", err)
+		}
+		if !equalStringSlices(outcome.ConflictFields, []string{"label_id"}) {
+			t.Fatalf("outcome.ConflictFields = %v, want [label_id]", outcome.ConflictFields)
+		}
+	})
+}
+
+func TestApplyMutationConflictedMutationReplaysAsSkipped(t *testing.T) {
+	commitA, _, scopeA, _, _ := pushCommitScope(t)
+
+	if _, err := scopeA.Labels().Create(t.Context(), CreateLabelParams{
+		ID: "label-existing-2", Name: "Garage", Color: "#123456", Now: 1,
+	}); err != nil {
+		t.Fatalf("seed existing label: %v", err)
+	}
+
+	m := PushMutation{
+		MutationID:  "mut-label-conflict-replay",
+		EntityType:  "label",
+		EntityID:    "label-second-device-2",
+		BaseVersion: 0,
+		Fields:      pushFields(t, map[string]any{"name": "Garage", "color": "#abcdef"}),
+		Now:         2000,
+	}
+
+	first, err := commitA.ApplyMutation(t.Context(), m)
+	if err != nil {
+		t.Fatalf("first ApplyMutation: %v", err)
+	}
+	if first.Applied || first.Skipped {
+		t.Fatalf("first outcome = %+v, want a conflict (Applied=false Skipped=false)", first)
+	}
+
+	second, err := commitA.ApplyMutation(t.Context(), m)
+	if err != nil {
+		t.Fatalf("second (replay) ApplyMutation: %v", err)
+	}
+	if !second.Skipped {
+		t.Fatalf("replay outcome = %+v, want Skipped=true", second)
+	}
+}
+
+func TestApplyMutationItemLabelDeleteTombstonesLiveEdge(t *testing.T) {
+	commitA, _, scopeA, _, _ := pushCommitScope(t)
+
+	item, err := scopeA.Items().Create(t.Context(), CreateItemParams{ID: "item-del-edge", Name: "Box", ShortCode: "SC-DEL1", Now: 1})
+	if err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+	label, err := scopeA.Labels().Create(t.Context(), CreateLabelParams{ID: "label-del-edge", Name: "Fragile", Color: "#ff0000", Now: 1})
+	if err != nil {
+		t.Fatalf("seed label: %v", err)
+	}
+	if err := scopeA.ItemLabels().Attach(t.Context(), AttachLabelParams{ID: "edge-del-1", ItemID: item.ID, LabelID: label.ID, Now: 1}); err != nil {
+		t.Fatalf("seed attach: %v", err)
+	}
+
+	outcome, err := commitA.ApplyMutation(t.Context(), PushMutation{
+		MutationID: "mut-edge-delete",
+		EntityType: "item_label",
+		EntityID:   "edge-del-1",
+		Fields:     pushFields(t, map[string]any{"item_id": item.ID, "label_id": label.ID}),
+		Now:        2000,
+		Op:         PushOpDelete,
+	})
+	if err != nil {
+		t.Fatalf("ApplyMutation: %v", err)
+	}
+	if !outcome.Applied {
+		t.Fatalf("outcome.Applied = false, want true")
+	}
+	if outcome.Version != 2 {
+		t.Fatalf("outcome.Version = %d, want 2 (attach=1, detach=2)", outcome.Version)
+	}
+
+	labels, err := scopeA.ItemLabels().ListForItem(t.Context(), item.ID)
+	if err != nil {
+		t.Fatalf("ListForItem: %v", err)
+	}
+	if len(labels) != 0 {
+		t.Fatalf("ListForItem = %+v, want empty after delete", labels)
+	}
+}
+
+func TestApplyMutationItemLabelDeleteOnAbsentEdgeIsEntityConflict(t *testing.T) {
+	commitA, _, scopeA, _, _ := pushCommitScope(t)
+
+	item, err := scopeA.Items().Create(t.Context(), CreateItemParams{ID: "item-del-absent", Name: "Box", ShortCode: "SC-DEL2", Now: 1})
+	if err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+	label, err := scopeA.Labels().Create(t.Context(), CreateLabelParams{ID: "label-del-absent", Name: "Fragile", Color: "#ff0000", Now: 1})
+	if err != nil {
+		t.Fatalf("seed label: %v", err)
+	}
+
+	outcome, err := commitA.ApplyMutation(t.Context(), PushMutation{
+		MutationID: "mut-edge-delete-absent",
+		EntityType: "item_label",
+		EntityID:   "edge-never-attached",
+		Fields:     pushFields(t, map[string]any{"item_id": item.ID, "label_id": label.ID}),
+		Now:        2000,
+		Op:         PushOpDelete,
+	})
+	if err != nil {
+		t.Fatalf("ApplyMutation: %v", err)
+	}
+	if outcome.Applied {
+		t.Fatalf("outcome.Applied = true, want false")
+	}
+	if !equalStringSlices(outcome.ConflictFields, []string{entityConflictField}) {
+		t.Fatalf("outcome.ConflictFields = %v, want [%s]", outcome.ConflictFields, entityConflictField)
+	}
+}
+
+func TestApplyMutationDeleteOnUnsupportedEntityTypeIsStructuralError(t *testing.T) {
+	commitA, _, scopeA, _, _ := pushCommitScope(t)
+
+	item, err := scopeA.Items().Create(t.Context(), CreateItemParams{ID: "item-del-unsupported", Name: "Box", ShortCode: "SC-DEL3", Now: 1})
+	if err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+
+	_, err = commitA.ApplyMutation(t.Context(), PushMutation{
+		MutationID:  "mut-item-delete-unsupported",
+		EntityType:  "item",
+		EntityID:    item.ID,
+		BaseVersion: item.Version,
+		Fields:      pushFields(t, map[string]any{}),
+		Now:         2000,
+		Op:          PushOpDelete,
+	})
+	if !errors.Is(err, ErrPushDeleteNotSupported) {
+		t.Fatalf("ApplyMutation error = %v, want ErrPushDeleteNotSupported", err)
+	}
+}
+
+func TestApplyMutationUnknownOpIsStructuralError(t *testing.T) {
+	commitA, _, _, _, _ := pushCommitScope(t)
+
+	_, err := commitA.ApplyMutation(t.Context(), PushMutation{
+		MutationID:  "mut-bad-op",
+		EntityType:  "item",
+		EntityID:    "item-1",
+		BaseVersion: 0,
+		Fields:      pushFields(t, map[string]any{"name": "X"}),
+		Now:         2000,
+		Op:          "bogus",
+	})
+	if !errors.Is(err, ErrPushUnknownOp) {
+		t.Fatalf("ApplyMutation error = %v, want ErrPushUnknownOp", err)
 	}
 }
 

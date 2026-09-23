@@ -24,7 +24,8 @@ function allVisible() {
 
 function baseRoutes(overrides: Routes = {}): Routes {
   return {
-    'GET /api/v1/auth/sessions': () => jsonResponse(200, { sessions: [] }),
+    'GET /api/v1/auth/me': () =>
+      jsonResponse(200, { group_id: 'g', user_id: 'u', username: 'anton', role: 'owner' }),
     'GET /api/v1/locations/tree': () => jsonResponse(200, { tree: [] }),
     'GET /api/v1/locations': () => jsonResponse(200, { locations: [] }),
     'GET /api/v1/labels': () => jsonResponse(200, { labels: [] }),
@@ -89,7 +90,8 @@ describe('ItemEditView detail blocks, all visible', () => {
 
   it('does not mount any detail block for a NEW item, which has no id to scope them to', async () => {
     stubRoutedFetch({
-      'GET /api/v1/auth/sessions': () => jsonResponse(200, { sessions: [] }),
+      'GET /api/v1/auth/me': () =>
+        jsonResponse(200, { group_id: 'g', user_id: 'u', username: 'anton', role: 'owner' }),
       'GET /api/v1/locations/tree': () => jsonResponse(200, { tree: [] }),
       'GET /api/v1/locations': () => jsonResponse(200, { locations: [] }),
       'GET /api/v1/labels': () => jsonResponse(200, { labels: [] }),

@@ -96,6 +96,17 @@ describe('LoginView first-run registration', () => {
   })
 })
 
+describe('LoginView invite entry point', () => {
+  it('links to /join for someone who already holds an invite', async () => {
+    stubFetch(200, { sessions: [] })
+    const wrapper = await mountLogin()
+
+    const link = wrapper.get('.login__join a')
+    expect(link.attributes('href')).toBe('/join')
+    expect(link.text()).toBe('Join a household')
+  })
+})
+
 describe('LoginView mode discoverability', () => {
   it('offers both actions at equal weight from the first render', async () => {
     stubFetch(200, { sessions: [] })

@@ -21,9 +21,43 @@ var (
 	ErrPushInvalidFieldValue  = errors.New("storage: push: a field value does not decode to the type this field expects")
 	ErrPushAttachmentRejected = errors.New("storage: push: attachment mutations are rejected; attachment bytes travel through the photo-queue, never through push fields")
 	ErrPushCreationOnly       = errors.New("storage: push: this entity_type is creation-only over push; base_version must be 0")
+	ErrPushUnknownOp          = errors.New("storage: push: op is not one of upsert/delete")
+	ErrPushDeleteNotSupported = errors.New("storage: push: op: delete is not supported for this entity_type")
 )
 
+func IsPushStructuralError(err error) bool {
+	switch {
+	case errors.Is(err, ErrPushUnknownEntityType),
+		errors.Is(err, ErrPushUnknownField),
+		errors.Is(err, ErrPushMissingField),
+		errors.Is(err, ErrPushInvalidFieldValue),
+		errors.Is(err, ErrPushAttachmentRejected),
+		errors.Is(err, ErrPushCreationOnly),
+		errors.Is(err, ErrPushUnknownOp),
+		errors.Is(err, ErrPushDeleteNotSupported):
+		return true
+	default:
+		return false
+	}
+}
+
 var pushCommitFailAfterEntityWrite func() error
+
+var pushNewItemShortCode = newImportShortCode
+
+type PushOp string
+
+const (
+	PushOpUpsert PushOp = "upsert"
+	PushOpDelete PushOp = "delete"
+)
+
+func (o PushOp) normalized() PushOp {
+	if o == "" {
+		return PushOpUpsert
+	}
+	return o
+}
 
 type PushMutation struct {
 	MutationID  string
@@ -32,18 +66,19 @@ type PushMutation struct {
 	BaseVersion int64
 	Fields      map[string]json.RawMessage
 	Now         int64
+	Op          PushOp
 }
 
 func (m PushMutation) validate() error {
 	switch {
 	case m.MutationID == "":
-		return errors.New("storage: PushMutation: MutationID is empty")
+		return fmt.Errorf("%w: %q", ErrPushMissingField, "mutation_id")
 	case m.EntityType == "":
-		return errors.New("storage: PushMutation: EntityType is empty")
+		return fmt.Errorf("%w: %q", ErrPushMissingField, "entity_type")
 	case m.EntityID == "":
-		return errors.New("storage: PushMutation: EntityID is empty")
+		return fmt.Errorf("%w: %q", ErrPushMissingField, "entity_id")
 	case m.BaseVersion < 0:
-		return errors.New("storage: PushMutation: BaseVersion must not be negative")
+		return fmt.Errorf("%w: %q", ErrPushInvalidFieldValue, "base_version")
 	case m.Now <= 0:
 		return errors.New("storage: PushMutation: Now must be a positive Unix-millisecond timestamp")
 	}
@@ -57,6 +92,7 @@ type PushOutcome struct {
 	EntityID       string
 	Version        int64
 	ConflictFields []string
+	FieldSnapshots map[string]string
 }
 
 type PushCommitRepository interface {
@@ -99,12 +135,23 @@ func (r pushCommitRepository) ApplyMutation(ctx context.Context, m PushMutation)
 			return fmt.Errorf("storage: push: check mutation ledger for %q: %w", m.MutationID, err)
 		}
 
-		handler, ok := pushEntityDispatch[m.EntityType]
-		if !ok {
-			return fmt.Errorf("%w: %q", ErrPushUnknownEntityType, m.EntityType)
+		var result PushOutcome
+		var err error
+		switch m.Op.normalized() {
+		case PushOpDelete:
+			if m.EntityType != "item_label" {
+				return fmt.Errorf("%w: entity_type %q", ErrPushDeleteNotSupported, m.EntityType)
+			}
+			result, err = pushItemLabelDelete(ctx, tx, q, r.group, m)
+		case PushOpUpsert:
+			handler, ok := pushEntityDispatch[m.EntityType]
+			if !ok {
+				return fmt.Errorf("%w: %q", ErrPushUnknownEntityType, m.EntityType)
+			}
+			result, err = handler(ctx, tx, q, r.group, m)
+		default:
+			return fmt.Errorf("%w: %q", ErrPushUnknownOp, m.Op)
 		}
-
-		result, err := handler(ctx, tx, q, r.group, m)
 		if err != nil {
 			return err
 		}
@@ -139,6 +186,32 @@ func (r pushCommitRepository) ApplyMutation(ctx context.Context, m PushMutation)
 		}); err != nil {
 			return fmt.Errorf("storage: push: record mutation ledger row for %q: %w", m.MutationID, err)
 		}
+
+		for _, name := range outcome.ConflictFields {
+			conflictID, err := uuid.NewV7()
+			if err != nil {
+				return fmt.Errorf("storage: push: mint conflict row id: %w", err)
+			}
+			losing := ""
+			if name != entityConflictField {
+				if raw, ok := m.Fields[name]; ok {
+					losing = string(raw)
+				}
+			}
+			if _, err := insertConflictTx(ctx, q, r.group, InsertConflictParams{
+				ID:                        conflictID.String(),
+				EntityType:                m.EntityType,
+				EntityID:                  outcome.EntityID,
+				FieldName:                 name,
+				ServerValueSnapshot:       outcome.FieldSnapshots[name],
+				LosingClientValueSnapshot: losing,
+				DetectedAt:                m.Now,
+				MutationID:                ledgerID.String(),
+				Now:                       m.Now,
+			}); err != nil {
+				return fmt.Errorf("storage: push: record conflict %q for mutation %q: %w", name, m.MutationID, err)
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -171,10 +244,57 @@ var pushEntityDispatch = map[string]pushEntityHandler{
 	"attachment":           pushAttachment,
 }
 
-var pushVersionMismatchPolicy = pushWholeEntityMismatch
+var pushVersionMismatchPolicy = pushFieldLevelMergePolicy
 
-func pushWholeEntityMismatch(_ context.Context, _ *gen.Queries, _, _, _ string, fieldNames []string) (conflict, apply []string, err error) {
-	return fieldNames, nil, nil
+func pushFieldLevelMergePolicy(ctx context.Context, q *gen.Queries, group, entityType, entityID string, baseVersion int64, fieldNames []string) (conflict, apply []string, err error) {
+	tracked, err := lookupFieldVersionsTx(ctx, q, group, entityType, entityID)
+	if err != nil {
+		return nil, nil, err
+	}
+	versions := make(map[string]int64, len(tracked))
+	for _, row := range tracked {
+		versions[row.FieldName] = row.Version
+	}
+
+	for _, name := range fieldNames {
+		fv, tracked := versions[name]
+		if !tracked {
+			fv = 1
+		}
+		if fv > baseVersion {
+			conflict = append(conflict, name)
+		} else {
+			apply = append(apply, name)
+		}
+	}
+	return conflict, apply, nil
+}
+
+func pushRowExists(ctx context.Context, tx *sql.Tx, table, id string) (bool, error) {
+	var n int
+	err := tx.QueryRowContext(ctx, "SELECT 1 FROM "+table+" WHERE id = ? LIMIT 1", id).Scan(&n)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("storage: push: check existing row %q in %s: %w", id, table, err)
+	}
+	return true, nil
+}
+
+func pushClassifyEntityError(err error) (PushOutcome, bool) {
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return PushOutcome{ConflictFields: []string{"item_id"}}, true
+	case errors.Is(err, ErrWarrantyExists), errors.Is(err, ErrSaleExists), errors.Is(err, ErrPurchaseExists):
+		return PushOutcome{ConflictFields: []string{entityConflictField}}, true
+	case errors.Is(err, ErrLabelNameConflict):
+		return PushOutcome{ConflictFields: []string{"name"}}, true
+	case errors.Is(err, ErrLocationParentNotFound), errors.Is(err, ErrLocationCycle):
+		return PushOutcome{ConflictFields: []string{"parent_id"}}, true
+	default:
+		return PushOutcome{}, false
+	}
 }
 
 func pushFieldNames(fields map[string]json.RawMessage) []string {
@@ -291,6 +411,74 @@ func pushAllowSet(names []string) func(string) bool {
 		set[n] = true
 	}
 	return func(name string) bool { return set[name] }
+}
+
+func pushSnapshotJSON(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+func pushSnapshotServerValues(conflict []string, values map[string]any) map[string]string {
+	if len(conflict) == 0 {
+		return nil
+	}
+	var out map[string]string
+	for _, name := range conflict {
+		v, ok := values[name]
+		if !ok {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]string, len(conflict))
+		}
+		out[name] = pushSnapshotJSON(v)
+	}
+	return out
+}
+
+var pushCustomFieldValueUnion = []string{"field_type", "text_value", "number_value", "bool_value", "date_value"}
+
+func pushCustomFieldValueUnionRule(fields map[string]json.RawMessage, conflict, apply []string) ([]string, []string) {
+	present := func(name string) bool {
+		_, ok := fields[name]
+		return ok
+	}
+	inConflict := make(map[string]bool, len(conflict))
+	for _, name := range conflict {
+		inConflict[name] = true
+	}
+
+	anyPresentUnionMemberConflicts := false
+	for _, name := range pushCustomFieldValueUnion {
+		if present(name) && inConflict[name] {
+			anyPresentUnionMemberConflicts = true
+			break
+		}
+	}
+	if !anyPresentUnionMemberConflicts {
+		return conflict, apply
+	}
+
+	moveToConflict := make(map[string]bool, len(pushCustomFieldValueUnion))
+	for _, name := range pushCustomFieldValueUnion {
+		if present(name) {
+			moveToConflict[name] = true
+		}
+	}
+	newApply := apply[:0:0]
+	for _, name := range apply {
+		if moveToConflict[name] {
+			inConflict[name] = true
+			continue
+		}
+		newApply = append(newApply, name)
+	}
+	newConflict := make([]string, 0, len(inConflict))
+	for name := range inConflict {
+		newConflict = append(newConflict, name)
+	}
+	sort.Strings(newConflict)
+	return newConflict, newApply
 }
 
 func pushMergeString(fields map[string]json.RawMessage, name string, allow func(string) bool, current string) (string, error) {
@@ -418,6 +606,14 @@ func pushItem(ctx context.Context, tx *sql.Tx, q *gen.Queries, group string, m P
 	}
 
 	if m.BaseVersion == 0 {
+		exists, err := pushRowExists(ctx, tx, "items", m.EntityID)
+		if err != nil {
+			return PushOutcome{}, err
+		}
+		if exists {
+			return PushOutcome{ConflictFields: []string{entityConflictField}}, nil
+		}
+
 		name, _, err := pushDecodeString(m.Fields, "name")
 		if err != nil {
 			return PushOutcome{}, err
@@ -438,7 +634,7 @@ func pushItem(ctx context.Context, tx *sql.Tx, q *gen.Queries, group string, m P
 		var created Item
 		var ok bool
 		for attempt := 0; attempt < maxImportShortCodeAttempts; attempt++ {
-			code, err := newImportShortCode()
+			code, err := pushNewItemShortCode()
 			if err != nil {
 				return PushOutcome{}, err
 			}
@@ -456,7 +652,7 @@ func pushItem(ctx context.Context, tx *sql.Tx, q *gen.Queries, group string, m P
 			break
 		}
 		if !ok {
-			return PushOutcome{}, fmt.Errorf("storage: push: create item %q: exhausted %d short-code attempts", m.EntityID, maxImportShortCodeAttempts)
+			return PushOutcome{ConflictFields: []string{"short_code"}}, nil
 		}
 		return PushOutcome{Applied: true, EntityID: created.ID, Version: created.Version}, nil
 	}
@@ -471,15 +667,20 @@ func pushItem(ctx context.Context, tx *sql.Tx, q *gen.Queries, group string, m P
 
 	allow := pushAllowAll
 	conflict := []string(nil)
+	var snapshots map[string]string
 	if current.Version != m.BaseVersion {
 		names := pushFieldNames(m.Fields)
 		var apply []string
-		conflict, apply, err = pushVersionMismatchPolicy(ctx, q, group, m.EntityType, m.EntityID, names)
+		conflict, apply, err = pushVersionMismatchPolicy(ctx, q, group, m.EntityType, m.EntityID, m.BaseVersion, names)
 		if err != nil {
 			return PushOutcome{}, err
 		}
+		snapshots = pushSnapshotServerValues(conflict, map[string]any{
+			"name": current.Name, "description": current.Description,
+			"location_id": stringFromNull(current.LocationID), "quantity": current.Quantity,
+		})
 		if len(apply) == 0 {
-			return PushOutcome{ConflictFields: conflict}, nil
+			return PushOutcome{ConflictFields: conflict, FieldSnapshots: snapshots}, nil
 		}
 		allow = pushAllowSet(apply)
 	}
@@ -506,9 +707,16 @@ func pushItem(ctx context.Context, tx *sql.Tx, q *gen.Queries, group string, m P
 		Quantity: quantity, ExpectedVersion: current.Version, Now: m.Now,
 	})
 	if err != nil {
+		if outcome, ok := pushClassifyEntityError(err); ok {
+			outcome.ConflictFields = append(outcome.ConflictFields, conflict...)
+			return outcome, nil
+		}
 		return PushOutcome{}, err
 	}
-	return PushOutcome{Applied: true, Version: updated.Version, ConflictFields: conflict}, nil
+	if err := recordFieldVersionsTx(ctx, q, group, "item", updated.ID, updated.Version, m.Now, diffItemFieldVersions(current, updated)); err != nil {
+		return PushOutcome{}, err
+	}
+	return PushOutcome{Applied: true, Version: updated.Version, ConflictFields: conflict, FieldSnapshots: snapshots}, nil
 }
 
 var pushWarrantyCreateFields = map[string]bool{
@@ -531,6 +739,13 @@ func pushWarrantyBlock(ctx context.Context, tx *sql.Tx, q *gen.Queries, group st
 		itemID, _, err := pushDecodeString(m.Fields, "item_id")
 		if err != nil {
 			return PushOutcome{}, err
+		}
+		exists, err := pushRowExists(ctx, tx, "item_warranty", m.EntityID)
+		if err != nil {
+			return PushOutcome{}, err
+		}
+		if exists {
+			return PushOutcome{ConflictFields: []string{entityConflictField}}, nil
 		}
 		holder, _, err := pushDecodeString(m.Fields, "holder")
 		if err != nil {
@@ -562,6 +777,9 @@ func pushWarrantyBlock(ctx context.Context, tx *sql.Tx, q *gen.Queries, group st
 			ExpiresOn: expiresOn, IsLifetime: isLifetime, Notes: notes, Now: m.Now,
 		})
 		if err != nil {
+			if outcome, ok := pushClassifyEntityError(err); ok {
+				return outcome, nil
+			}
 			return PushOutcome{}, err
 		}
 		return PushOutcome{Applied: true, EntityID: created.ID, Version: created.Version}, nil
@@ -588,15 +806,21 @@ func pushWarrantyBlock(ctx context.Context, tx *sql.Tx, q *gen.Queries, group st
 
 	allow := pushAllowAll
 	conflict := []string(nil)
+	var snapshots map[string]string
 	if current.Version != m.BaseVersion {
 		names := pushFieldNames(m.Fields)
 		var apply []string
-		conflict, apply, err = pushVersionMismatchPolicy(ctx, q, group, m.EntityType, m.EntityID, names)
+		conflict, apply, err = pushVersionMismatchPolicy(ctx, q, group, m.EntityType, m.EntityID, m.BaseVersion, names)
 		if err != nil {
 			return PushOutcome{}, err
 		}
+		snapshots = pushSnapshotServerValues(conflict, map[string]any{
+			"holder": current.Holder, "provider": current.Provider,
+			"starts_on": stringFromNull(current.StartsOn), "expires_on": stringFromNull(current.ExpiresOn),
+			"is_lifetime": boolFromInt(current.IsLifetime), "notes": current.Notes,
+		})
 		if len(apply) == 0 {
-			return PushOutcome{EntityID: current.ID, ConflictFields: conflict}, nil
+			return PushOutcome{EntityID: current.ID, ConflictFields: conflict, FieldSnapshots: snapshots}, nil
 		}
 		allow = pushAllowSet(apply)
 	}
@@ -631,9 +855,16 @@ func pushWarrantyBlock(ctx context.Context, tx *sql.Tx, q *gen.Queries, group st
 		IsLifetime: isLifetime, Notes: notes, ExpectedVersion: current.Version, Now: m.Now,
 	})
 	if err != nil {
+		if outcome, ok := pushClassifyEntityError(err); ok {
+			outcome.ConflictFields = append(outcome.ConflictFields, conflict...)
+			return outcome, nil
+		}
 		return PushOutcome{}, err
 	}
-	return PushOutcome{Applied: true, EntityID: updated.ID, Version: updated.Version, ConflictFields: conflict}, nil
+	if err := recordFieldVersionsTx(ctx, q, group, "warranty_block", updated.ID, updated.Version, m.Now, diffWarrantyFieldVersions(current, updated)); err != nil {
+		return PushOutcome{}, err
+	}
+	return PushOutcome{Applied: true, EntityID: updated.ID, Version: updated.Version, ConflictFields: conflict, FieldSnapshots: snapshots}, nil
 }
 
 var pushSaleCreateFields = map[string]bool{
@@ -652,6 +883,13 @@ func pushSoldToBlock(ctx context.Context, tx *sql.Tx, q *gen.Queries, group stri
 		itemID, _, err := pushDecodeString(m.Fields, "item_id")
 		if err != nil {
 			return PushOutcome{}, err
+		}
+		exists, err := pushRowExists(ctx, tx, "item_sale", m.EntityID)
+		if err != nil {
+			return PushOutcome{}, err
+		}
+		if exists {
+			return PushOutcome{ConflictFields: []string{entityConflictField}}, nil
 		}
 		buyerName, _, err := pushDecodeString(m.Fields, "buyer_name")
 		if err != nil {
@@ -675,6 +913,9 @@ func pushSoldToBlock(ctx context.Context, tx *sql.Tx, q *gen.Queries, group stri
 			SalePriceMinor: salePriceMinor, Notes: notes, Now: m.Now,
 		})
 		if err != nil {
+			if outcome, ok := pushClassifyEntityError(err); ok {
+				return outcome, nil
+			}
 			return PushOutcome{}, err
 		}
 		return PushOutcome{Applied: true, EntityID: created.ID, Version: created.Version}, nil
@@ -701,15 +942,20 @@ func pushSoldToBlock(ctx context.Context, tx *sql.Tx, q *gen.Queries, group stri
 
 	allow := pushAllowAll
 	conflict := []string(nil)
+	var snapshots map[string]string
 	if current.Version != m.BaseVersion {
 		names := pushFieldNames(m.Fields)
 		var apply []string
-		conflict, apply, err = pushVersionMismatchPolicy(ctx, q, group, m.EntityType, m.EntityID, names)
+		conflict, apply, err = pushVersionMismatchPolicy(ctx, q, group, m.EntityType, m.EntityID, m.BaseVersion, names)
 		if err != nil {
 			return PushOutcome{}, err
 		}
+		snapshots = pushSnapshotServerValues(conflict, map[string]any{
+			"buyer_name": current.BuyerName, "sold_on": stringFromNull(current.SoldOn),
+			"sale_price_minor": current.SalePriceMinor, "notes": current.Notes,
+		})
 		if len(apply) == 0 {
-			return PushOutcome{EntityID: current.ID, ConflictFields: conflict}, nil
+			return PushOutcome{EntityID: current.ID, ConflictFields: conflict, FieldSnapshots: snapshots}, nil
 		}
 		allow = pushAllowSet(apply)
 	}
@@ -736,9 +982,16 @@ func pushSoldToBlock(ctx context.Context, tx *sql.Tx, q *gen.Queries, group stri
 		Notes: notes, ExpectedVersion: current.Version, Now: m.Now,
 	})
 	if err != nil {
+		if outcome, ok := pushClassifyEntityError(err); ok {
+			outcome.ConflictFields = append(outcome.ConflictFields, conflict...)
+			return outcome, nil
+		}
 		return PushOutcome{}, err
 	}
-	return PushOutcome{Applied: true, EntityID: updated.ID, Version: updated.Version, ConflictFields: conflict}, nil
+	if err := recordFieldVersionsTx(ctx, q, group, "sold_to_block", updated.ID, updated.Version, m.Now, diffSaleFieldVersions(current, updated)); err != nil {
+		return PushOutcome{}, err
+	}
+	return PushOutcome{Applied: true, EntityID: updated.ID, Version: updated.Version, ConflictFields: conflict, FieldSnapshots: snapshots}, nil
 }
 
 var pushPurchaseCreateFields = map[string]bool{
@@ -758,6 +1011,13 @@ func pushPurchasedFromBlock(ctx context.Context, tx *sql.Tx, q *gen.Queries, gro
 		itemID, _, err := pushDecodeString(m.Fields, "item_id")
 		if err != nil {
 			return PushOutcome{}, err
+		}
+		exists, err := pushRowExists(ctx, tx, "item_purchase", m.EntityID)
+		if err != nil {
+			return PushOutcome{}, err
+		}
+		if exists {
+			return PushOutcome{ConflictFields: []string{entityConflictField}}, nil
 		}
 		vendor, _, err := pushDecodeString(m.Fields, "vendor")
 		if err != nil {
@@ -785,6 +1045,9 @@ func pushPurchasedFromBlock(ctx context.Context, tx *sql.Tx, q *gen.Queries, gro
 			PurchasePriceMinor: purchasePriceMinor, OrderReference: orderReference, Notes: notes, Now: m.Now,
 		})
 		if err != nil {
+			if outcome, ok := pushClassifyEntityError(err); ok {
+				return outcome, nil
+			}
 			return PushOutcome{}, err
 		}
 		return PushOutcome{Applied: true, EntityID: created.ID, Version: created.Version}, nil
@@ -811,15 +1074,21 @@ func pushPurchasedFromBlock(ctx context.Context, tx *sql.Tx, q *gen.Queries, gro
 
 	allow := pushAllowAll
 	conflict := []string(nil)
+	var snapshots map[string]string
 	if current.Version != m.BaseVersion {
 		names := pushFieldNames(m.Fields)
 		var apply []string
-		conflict, apply, err = pushVersionMismatchPolicy(ctx, q, group, m.EntityType, m.EntityID, names)
+		conflict, apply, err = pushVersionMismatchPolicy(ctx, q, group, m.EntityType, m.EntityID, m.BaseVersion, names)
 		if err != nil {
 			return PushOutcome{}, err
 		}
+		snapshots = pushSnapshotServerValues(conflict, map[string]any{
+			"vendor": current.Vendor, "purchased_on": stringFromNull(current.PurchasedOn),
+			"purchase_price_minor": current.PurchasePriceMinor, "order_reference": current.OrderReference,
+			"notes": current.Notes,
+		})
 		if len(apply) == 0 {
-			return PushOutcome{EntityID: current.ID, ConflictFields: conflict}, nil
+			return PushOutcome{EntityID: current.ID, ConflictFields: conflict, FieldSnapshots: snapshots}, nil
 		}
 		allow = pushAllowSet(apply)
 	}
@@ -850,9 +1119,16 @@ func pushPurchasedFromBlock(ctx context.Context, tx *sql.Tx, q *gen.Queries, gro
 		OrderReference: orderReference, Notes: notes, ExpectedVersion: current.Version, Now: m.Now,
 	})
 	if err != nil {
+		if outcome, ok := pushClassifyEntityError(err); ok {
+			outcome.ConflictFields = append(outcome.ConflictFields, conflict...)
+			return outcome, nil
+		}
 		return PushOutcome{}, err
 	}
-	return PushOutcome{Applied: true, EntityID: updated.ID, Version: updated.Version, ConflictFields: conflict}, nil
+	if err := recordFieldVersionsTx(ctx, q, group, "purchased_from_block", updated.ID, updated.Version, m.Now, diffPurchaseFieldVersions(current, updated)); err != nil {
+		return PushOutcome{}, err
+	}
+	return PushOutcome{Applied: true, EntityID: updated.ID, Version: updated.Version, ConflictFields: conflict, FieldSnapshots: snapshots}, nil
 }
 
 var pushIdentificationCreateFields = map[string]bool{"item_id": true, "kind": true, "value": true}
@@ -870,6 +1146,13 @@ func pushItemIdentification(ctx context.Context, tx *sql.Tx, q *gen.Queries, gro
 		if err != nil {
 			return PushOutcome{}, err
 		}
+		exists, err := pushRowExists(ctx, tx, "item_identifications", m.EntityID)
+		if err != nil {
+			return PushOutcome{}, err
+		}
+		if exists {
+			return PushOutcome{ConflictFields: []string{entityConflictField}}, nil
+		}
 		kind, _, err := pushDecodeString(m.Fields, "kind")
 		if err != nil {
 			return PushOutcome{}, err
@@ -883,6 +1166,9 @@ func pushItemIdentification(ctx context.Context, tx *sql.Tx, q *gen.Queries, gro
 			ID: m.EntityID, ItemID: itemID, Kind: kind, Value: value, Now: m.Now,
 		})
 		if err != nil {
+			if outcome, ok := pushClassifyEntityError(err); ok {
+				return outcome, nil
+			}
 			return PushOutcome{}, err
 		}
 		return PushOutcome{Applied: true, EntityID: created.ID, Version: created.Version}, nil
@@ -909,15 +1195,19 @@ func pushItemIdentification(ctx context.Context, tx *sql.Tx, q *gen.Queries, gro
 
 	allow := pushAllowAll
 	conflict := []string(nil)
+	var snapshots map[string]string
 	if current.Version != m.BaseVersion {
 		names := pushFieldNames(m.Fields)
 		var apply []string
-		conflict, apply, err = pushVersionMismatchPolicy(ctx, q, group, m.EntityType, m.EntityID, names)
+		conflict, apply, err = pushVersionMismatchPolicy(ctx, q, group, m.EntityType, m.EntityID, m.BaseVersion, names)
 		if err != nil {
 			return PushOutcome{}, err
 		}
+		snapshots = pushSnapshotServerValues(conflict, map[string]any{
+			"kind": current.Kind, "value": current.Value,
+		})
 		if len(apply) == 0 {
-			return PushOutcome{ConflictFields: conflict}, nil
+			return PushOutcome{ConflictFields: conflict, FieldSnapshots: snapshots}, nil
 		}
 		allow = pushAllowSet(apply)
 	}
@@ -935,9 +1225,16 @@ func pushItemIdentification(ctx context.Context, tx *sql.Tx, q *gen.Queries, gro
 		ItemID: itemID, ID: m.EntityID, Kind: kind, Value: value, ExpectedVersion: current.Version, Now: m.Now,
 	})
 	if err != nil {
+		if outcome, ok := pushClassifyEntityError(err); ok {
+			outcome.ConflictFields = append(outcome.ConflictFields, conflict...)
+			return outcome, nil
+		}
 		return PushOutcome{}, err
 	}
-	return PushOutcome{Applied: true, Version: updated.Version, ConflictFields: conflict}, nil
+	if err := recordFieldVersionsTx(ctx, q, group, "item_identification", updated.ID, updated.Version, m.Now, diffIdentificationFieldVersions(current, updated)); err != nil {
+		return PushOutcome{}, err
+	}
+	return PushOutcome{Applied: true, Version: updated.Version, ConflictFields: conflict, FieldSnapshots: snapshots}, nil
 }
 
 var pushCustomFieldCreateFields = map[string]bool{
@@ -957,6 +1254,13 @@ func pushItemCustomField(ctx context.Context, tx *sql.Tx, q *gen.Queries, group 
 		itemID, _, err := pushDecodeString(m.Fields, "item_id")
 		if err != nil {
 			return PushOutcome{}, err
+		}
+		exists, err := pushRowExists(ctx, tx, "item_custom_fields", m.EntityID)
+		if err != nil {
+			return PushOutcome{}, err
+		}
+		if exists {
+			return PushOutcome{ConflictFields: []string{entityConflictField}}, nil
 		}
 		fieldDefID, _, err := pushDecodeString(m.Fields, "field_def_id")
 		if err != nil {
@@ -992,6 +1296,9 @@ func pushItemCustomField(ctx context.Context, tx *sql.Tx, q *gen.Queries, group 
 			TextValue: textValue, NumberValue: numberValue, BoolValue: boolValue, DateValue: dateValue, Now: m.Now,
 		})
 		if err != nil {
+			if outcome, ok := pushClassifyEntityError(err); ok {
+				return outcome, nil
+			}
 			return PushOutcome{}, err
 		}
 		return PushOutcome{Applied: true, EntityID: created.ID, Version: created.Version}, nil
@@ -1018,15 +1325,25 @@ func pushItemCustomField(ctx context.Context, tx *sql.Tx, q *gen.Queries, group 
 
 	allow := pushAllowAll
 	conflict := []string(nil)
+	var snapshots map[string]string
 	if current.Version != m.BaseVersion {
 		names := pushFieldNames(m.Fields)
 		var apply []string
-		conflict, apply, err = pushVersionMismatchPolicy(ctx, q, group, m.EntityType, m.EntityID, names)
+		conflict, apply, err = pushVersionMismatchPolicy(ctx, q, group, m.EntityType, m.EntityID, m.BaseVersion, names)
 		if err != nil {
 			return PushOutcome{}, err
 		}
+		conflict, apply = pushCustomFieldValueUnionRule(m.Fields, conflict, apply)
+		snapshots = pushSnapshotServerValues(conflict, map[string]any{
+			"field_def_id": stringFromNull(current.FieldDefID), "name": current.Name,
+			"field_type":   current.FieldType,
+			"text_value":   ptrFromNullString(current.TextValue),
+			"number_value": ptrFromNullFloat64(current.NumberValue),
+			"bool_value":   ptrFromNullBool(current.BoolValue),
+			"date_value":   ptrFromNullString(current.DateValue),
+		})
 		if len(apply) == 0 {
-			return PushOutcome{ConflictFields: conflict}, nil
+			return PushOutcome{ConflictFields: conflict, FieldSnapshots: snapshots}, nil
 		}
 		allow = pushAllowSet(apply)
 	}
@@ -1066,9 +1383,16 @@ func pushItemCustomField(ctx context.Context, tx *sql.Tx, q *gen.Queries, group 
 		ExpectedVersion: current.Version, Now: m.Now,
 	})
 	if err != nil {
+		if outcome, ok := pushClassifyEntityError(err); ok {
+			outcome.ConflictFields = append(outcome.ConflictFields, conflict...)
+			return outcome, nil
+		}
 		return PushOutcome{}, err
 	}
-	return PushOutcome{Applied: true, Version: updated.Version, ConflictFields: conflict}, nil
+	if err := recordFieldVersionsTx(ctx, q, group, "item_custom_field", updated.ID, updated.Version, m.Now, diffItemCustomFieldFieldVersions(current, updated)); err != nil {
+		return PushOutcome{}, err
+	}
+	return PushOutcome{Applied: true, Version: updated.Version, ConflictFields: conflict, FieldSnapshots: snapshots}, nil
 }
 
 var pushLocationFields = map[string]bool{"name": true, "parent_id": true}
@@ -1079,6 +1403,13 @@ func pushLocation(ctx context.Context, tx *sql.Tx, q *gen.Queries, group string,
 	}
 
 	if m.BaseVersion == 0 {
+		exists, err := pushRowExists(ctx, tx, "locations", m.EntityID)
+		if err != nil {
+			return PushOutcome{}, err
+		}
+		if exists {
+			return PushOutcome{ConflictFields: []string{entityConflictField}}, nil
+		}
 		name, _, err := pushDecodeString(m.Fields, "name")
 		if err != nil {
 			return PushOutcome{}, err
@@ -1091,6 +1422,9 @@ func pushLocation(ctx context.Context, tx *sql.Tx, q *gen.Queries, group string,
 			ID: m.EntityID, Name: name, ParentID: parentID, Now: m.Now,
 		})
 		if err != nil {
+			if outcome, ok := pushClassifyEntityError(err); ok {
+				return outcome, nil
+			}
 			return PushOutcome{}, err
 		}
 		return PushOutcome{Applied: true, EntityID: created.ID, Version: created.Version}, nil
@@ -1106,15 +1440,19 @@ func pushLocation(ctx context.Context, tx *sql.Tx, q *gen.Queries, group string,
 
 	allow := pushAllowAll
 	conflict := []string(nil)
+	var snapshots map[string]string
 	if current.Version != m.BaseVersion {
 		names := pushFieldNames(m.Fields)
 		var apply []string
-		conflict, apply, err = pushVersionMismatchPolicy(ctx, q, group, m.EntityType, m.EntityID, names)
+		conflict, apply, err = pushVersionMismatchPolicy(ctx, q, group, m.EntityType, m.EntityID, m.BaseVersion, names)
 		if err != nil {
 			return PushOutcome{}, err
 		}
+		snapshots = pushSnapshotServerValues(conflict, map[string]any{
+			"name": current.Name, "parent_id": stringFromNull(current.ParentID),
+		})
 		if len(apply) == 0 {
-			return PushOutcome{ConflictFields: conflict}, nil
+			return PushOutcome{ConflictFields: conflict, FieldSnapshots: snapshots}, nil
 		}
 		allow = pushAllowSet(apply)
 	}
@@ -1132,9 +1470,16 @@ func pushLocation(ctx context.Context, tx *sql.Tx, q *gen.Queries, group string,
 		LocationID: m.EntityID, Name: name, ParentID: parentID, ExpectedVersion: current.Version, Now: m.Now,
 	})
 	if err != nil {
+		if outcome, ok := pushClassifyEntityError(err); ok {
+			outcome.ConflictFields = append(outcome.ConflictFields, conflict...)
+			return outcome, nil
+		}
 		return PushOutcome{}, err
 	}
-	return PushOutcome{Applied: true, Version: updated.Version, ConflictFields: conflict}, nil
+	if err := recordFieldVersionsTx(ctx, q, group, "location", updated.ID, updated.Version, m.Now, diffLocationFieldVersions(current, updated)); err != nil {
+		return PushOutcome{}, err
+	}
+	return PushOutcome{Applied: true, Version: updated.Version, ConflictFields: conflict, FieldSnapshots: snapshots}, nil
 }
 
 var pushLabelFields = map[string]bool{"name": true, "color": true}
@@ -1145,6 +1490,13 @@ func pushLabel(ctx context.Context, tx *sql.Tx, q *gen.Queries, group string, m 
 	}
 
 	if m.BaseVersion == 0 {
+		exists, err := pushRowExists(ctx, tx, "labels", m.EntityID)
+		if err != nil {
+			return PushOutcome{}, err
+		}
+		if exists {
+			return PushOutcome{ConflictFields: []string{entityConflictField}}, nil
+		}
 		name, _, err := pushDecodeString(m.Fields, "name")
 		if err != nil {
 			return PushOutcome{}, err
@@ -1157,6 +1509,9 @@ func pushLabel(ctx context.Context, tx *sql.Tx, q *gen.Queries, group string, m 
 			ID: m.EntityID, Name: name, Color: color, Now: m.Now,
 		})
 		if err != nil {
+			if outcome, ok := pushClassifyEntityError(err); ok {
+				return outcome, nil
+			}
 			return PushOutcome{}, err
 		}
 		return PushOutcome{Applied: true, EntityID: created.ID, Version: created.Version}, nil
@@ -1172,15 +1527,19 @@ func pushLabel(ctx context.Context, tx *sql.Tx, q *gen.Queries, group string, m 
 
 	allow := pushAllowAll
 	conflict := []string(nil)
+	var snapshots map[string]string
 	if current.Version != m.BaseVersion {
 		names := pushFieldNames(m.Fields)
 		var apply []string
-		conflict, apply, err = pushVersionMismatchPolicy(ctx, q, group, m.EntityType, m.EntityID, names)
+		conflict, apply, err = pushVersionMismatchPolicy(ctx, q, group, m.EntityType, m.EntityID, m.BaseVersion, names)
 		if err != nil {
 			return PushOutcome{}, err
 		}
+		snapshots = pushSnapshotServerValues(conflict, map[string]any{
+			"name": current.Name, "color": current.Color,
+		})
 		if len(apply) == 0 {
-			return PushOutcome{ConflictFields: conflict}, nil
+			return PushOutcome{ConflictFields: conflict, FieldSnapshots: snapshots}, nil
 		}
 		allow = pushAllowSet(apply)
 	}
@@ -1198,9 +1557,16 @@ func pushLabel(ctx context.Context, tx *sql.Tx, q *gen.Queries, group string, m 
 		ID: m.EntityID, Name: name, Color: color, ExpectedVersion: current.Version, Now: m.Now,
 	})
 	if err != nil {
+		if outcome, ok := pushClassifyEntityError(err); ok {
+			outcome.ConflictFields = append(outcome.ConflictFields, conflict...)
+			return outcome, nil
+		}
 		return PushOutcome{}, err
 	}
-	return PushOutcome{Applied: true, Version: updated.Version, ConflictFields: conflict}, nil
+	if err := recordFieldVersionsTx(ctx, q, group, "label", updated.ID, updated.Version, m.Now, diffLabelFieldVersions(current, updated)); err != nil {
+		return PushOutcome{}, err
+	}
+	return PushOutcome{Applied: true, Version: updated.Version, ConflictFields: conflict, FieldSnapshots: snapshots}, nil
 }
 
 var pushItemLabelFields = map[string]bool{"item_id": true, "label_id": true}
@@ -1227,6 +1593,27 @@ func pushItemLabel(ctx context.Context, tx *sql.Tx, q *gen.Queries, group string
 		return PushOutcome{}, err
 	}
 
+	exists, err := pushRowExists(ctx, tx, "item_labels", m.EntityID)
+	if err != nil {
+		return PushOutcome{}, err
+	}
+	if exists {
+		return PushOutcome{ConflictFields: []string{entityConflictField}}, nil
+	}
+
+	if _, err := q.GetItem(ctx, gen.GetItemParams{GroupID: group, ItemID: itemID}); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return PushOutcome{ConflictFields: []string{"item_id"}}, nil
+		}
+		return PushOutcome{}, fmt.Errorf("storage: push: get item %q for item_label attach: %w", itemID, err)
+	}
+	if _, err := q.GetLabel(ctx, gen.GetLabelParams{GroupID: group, ID: labelID}); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return PushOutcome{ConflictFields: []string{"label_id"}}, nil
+		}
+		return PushOutcome{}, fmt.Errorf("storage: push: get label %q for item_label attach: %w", labelID, err)
+	}
+
 	row, err := attachItemLabelTx(ctx, tx, q, group, AttachLabelParams{
 		ID: m.EntityID, ItemID: itemID, LabelID: labelID, Now: m.Now,
 	})
@@ -1234,6 +1621,41 @@ func pushItemLabel(ctx context.Context, tx *sql.Tx, q *gen.Queries, group string
 		return PushOutcome{}, err
 	}
 	return PushOutcome{Applied: true, EntityID: row.ID, Version: row.Version}, nil
+}
+
+var pushItemLabelDeleteFields = map[string]bool{"item_id": true, "label_id": true}
+
+func pushItemLabelDelete(ctx context.Context, tx *sql.Tx, q *gen.Queries, group string, m PushMutation) (PushOutcome, error) {
+	if err := pushRequireKnownFields(m.Fields, pushItemLabelDeleteFields); err != nil {
+		return PushOutcome{}, err
+	}
+	if err := pushRequireField(m.Fields, "item_id"); err != nil {
+		return PushOutcome{}, err
+	}
+	if err := pushRequireField(m.Fields, "label_id"); err != nil {
+		return PushOutcome{}, err
+	}
+	itemID, _, err := pushDecodeString(m.Fields, "item_id")
+	if err != nil {
+		return PushOutcome{}, err
+	}
+	labelID, _, err := pushDecodeString(m.Fields, "label_id")
+	if err != nil {
+		return PushOutcome{}, err
+	}
+
+	current, err := q.GetItemLabel(ctx, gen.GetItemLabelParams{GroupID: group, ItemID: itemID, LabelID: labelID})
+	if errors.Is(err, sql.ErrNoRows) {
+		return PushOutcome{ConflictFields: []string{entityConflictField}}, nil
+	}
+	if err != nil {
+		return PushOutcome{}, fmt.Errorf("storage: push: get item_label edge (%q,%q) for delete: %w", itemID, labelID, err)
+	}
+
+	if err := detachItemLabelTx(ctx, tx, q, group, itemID, labelID, m.Now); err != nil {
+		return PushOutcome{}, err
+	}
+	return PushOutcome{Applied: true, EntityID: current.ID, Version: current.Version + 1}, nil
 }
 
 var pushStockAdjustmentFields = map[string]bool{"item_id": true, "delta": true, "reason": true, "note": true}
@@ -1252,6 +1674,13 @@ func pushStockAdjustment(ctx context.Context, tx *sql.Tx, q *gen.Queries, group 
 	if err != nil {
 		return PushOutcome{}, err
 	}
+	exists, err := pushRowExists(ctx, tx, "stock_adjustments", m.EntityID)
+	if err != nil {
+		return PushOutcome{}, err
+	}
+	if exists {
+		return PushOutcome{ConflictFields: []string{entityConflictField}}, nil
+	}
 	delta, _, err := pushDecodeInt64(m.Fields, "delta")
 	if err != nil {
 		return PushOutcome{}, err
@@ -1265,10 +1694,25 @@ func pushStockAdjustment(ctx context.Context, tx *sql.Tx, q *gen.Queries, group 
 		return PushOutcome{}, err
 	}
 
+	before, beforeErr := q.GetItem(ctx, gen.GetItemParams{GroupID: group, ItemID: itemID})
+
 	created, err := createStockAdjustmentTx(ctx, tx, q, group, CreateStockAdjustmentParams{
 		ID: m.EntityID, ItemID: itemID, Delta: delta, Reason: reason, Note: note, Now: m.Now,
 	})
 	if err != nil {
+		if outcome, ok := pushClassifyEntityError(err); ok {
+			return outcome, nil
+		}
+		return PushOutcome{}, err
+	}
+	if beforeErr != nil {
+		return PushOutcome{}, fmt.Errorf("storage: push: item %q: field-version diff pre-read: %w", itemID, beforeErr)
+	}
+	after, err := q.GetItem(ctx, gen.GetItemParams{GroupID: group, ItemID: itemID})
+	if err != nil {
+		return PushOutcome{}, fmt.Errorf("storage: push: item %q: field-version diff post-read: %w", itemID, err)
+	}
+	if err := recordFieldVersionsTx(ctx, q, group, "item", after.ID, after.Version, m.Now, diffItemFieldVersions(before, after)); err != nil {
 		return PushOutcome{}, err
 	}
 	return PushOutcome{Applied: true, EntityID: created.ID, Version: created.Version}, nil

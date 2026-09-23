@@ -101,6 +101,10 @@ func validateCustomFieldContent(name, fieldType string, text *string, number *fl
 	return validateCustomFieldValueColumns(fieldType, text, number, boolean, date)
 }
 
+func ResolveCustomFieldDef(ctx context.Context, defRepo storage.CustomFieldDefRepository, fieldDefID, fieldType string) error {
+	return resolveFieldDef(ctx, defRepo, fieldDefID, fieldType)
+}
+
 func resolveFieldDef(ctx context.Context, defRepo storage.CustomFieldDefRepository, fieldDefID, fieldType string) error {
 	if fieldDefID == "" {
 		return nil

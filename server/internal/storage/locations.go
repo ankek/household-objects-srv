@@ -211,12 +211,18 @@ func (r locationRepository) Update(ctx context.Context, p UpdateLocationParams) 
 
 	var updated Location
 	err := r.writeTx(ctx, func(tx *sql.Tx, q *gen.Queries) error {
+		before, beforeErr := q.GetLocation(ctx, gen.GetLocationParams{GroupID: r.group(), LocationID: p.LocationID})
+
 		row, err := updateLocationTx(ctx, tx, q, r.group(), p)
 		if err != nil {
 			return err
 		}
 		updated = row
-		return nil
+
+		if beforeErr != nil {
+			return fmt.Errorf("storage: location %q: field-version diff pre-read: %w", p.LocationID, beforeErr)
+		}
+		return recordFieldVersionsTx(ctx, q, r.group(), "location", row.ID, row.Version, p.Now, diffLocationFieldVersions(before, row))
 	})
 	if err != nil {
 		return Location{}, err

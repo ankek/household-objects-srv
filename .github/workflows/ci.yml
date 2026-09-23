@@ -1,0 +1,274 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------------------------
+  # Go server — mirrors gate-build.sh "go-build" / "go-vet".
+  # ---------------------------------------------------------------------------------------------
+  go-build:
+    name: Go build (server)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Pinned from the module itself (`go 1.25.0`) so CI can never drift from go.mod.
+          go-version-file: server/go.mod
+          # setup-go's built-in cache covers both the module cache (GOMODCACHE) and the compiler
+          # build cache (GOCACHE), keyed on go.sum.
+          cache: true
+          cache-dependency-path: server/go.sum
+
+      - name: go build
+        working-directory: server
+        run: go build -o /dev/null ./cmd/... ./internal/... ./tests/...
+
+      - name: go vet
+        working-directory: server
+        run: go vet ./cmd/... ./internal/... ./tests/...
+
+      - name: go build (CGO_ENABLED=0) — NFR-005
+        working-directory: server
+
+        env:
+          CGO_ENABLED: '0'
+        run: go build -o /dev/null ./cmd/... ./internal/... ./tests/...
+
+  # ---------------------------------------------------------------------------------------------
+  # Web UI — mirrors gate-build.sh "web-install" / "web-build" (+ gate-lint.sh's cheap checks).
+  # ---------------------------------------------------------------------------------------------
+  web-build:
+    name: Web build (server/web)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: server/web
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          # package.json engines is a floor (">=20.19.0"), not a pin. 24 is the current LTS and the
+          # major developers run locally; bump deliberately, not implicitly.
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: server/web/package-lock.json
+
+      - name: npm ci
+        run: npm ci
+
+      - name: Type-check
+        # vue-tsc failures are compile errors, not style opinions — they fail the job.
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Lint (advisory)
+        # eslint + prettier. Reported, not enforced: no gates are enforced until D1.14.
+        continue-on-error: true
+        run: npm run lint
+
+  
+  openapi-drift:
+    name: OpenAPI drift (P-4/NFR-032/NFR-033)
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache: true
+          cache-dependency-path: server/go.sum
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          # For `npx @redocly/cli lint`, invoked by gate-contract-test.sh's openapi-lint leg.
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: server/web/package-lock.json
+
+      - name: Contract test gate (openapi-lint + openapi-drift + contract-tests)
+        run:../scripts/gate-contract-test.sh
+
+      - name: NFR-033 additive-only check (pull_request only)
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin "${{ github.event.pull_request.base.sha }}"
+          git show "${{ github.event.pull_request.base.sha }}:server/api/openapi.yaml" > /tmp/base-openapi.yaml
+         ../scripts/check-additive-api.sh /tmp/base-openapi.yaml server/api/openapi.yaml
+
+      - name: NFR-033 additive-only check skipped (no base ref on this event)
+
+        if: github.event_name != 'pull_request'
+        run: echo "::notice::NFR-033 additive-only check skipped — no PR base ref on a '${{ github.event_name }}' event. The openapi-drift step above still ran."
+
+  compose-smoke:
+    name: Compose smoke (NFR-026)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build image (tagged to match compose.yaml's pin — see job comment above)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ghcr.io/ankek/hho:0.1.0
+          cache-from: type=gha,scope=compose-smoke
+          cache-to: type=gha,mode=max,scope=compose-smoke
+
+      - name: Run compose-smoke gate (NFR-026)
+        run: ./scripts/gate-compose-smoke.sh
+
+      - name: Upload gate logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-smoke-gate-logs
+          path: .tmp/current/gates/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  go-coverage:
+    name: Go coverage >= 70% (NFR-030)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache: true
+          cache-dependency-path: server/go.sum
+
+      - name: Go coverage gate (race + 70% threshold — NFR-030)
+        run:../scripts/gate-go-coverage.sh
+
+      - name: Upload coverage profile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage-profile
+          path: .tmp/current/gates/go-coverage.out
+          if-no-files-found: ignore
+          retention-days: 7
+
+
+  go-govulncheck:
+    name: govulncheck (NFR-015)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache: true
+          cache-dependency-path: server/go.sum
+
+      - name: govulncheck gate (NFR-015)
+        run: ./scripts/gate-govulncheck.sh
+
+      - name: Upload govulncheck logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: govulncheck-logs
+          path: .tmp/current/gates/govulncheck*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  image-size:
+    name: Image size < 40 MB (NFR-003)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: hho:gate
+          cache-from: type=gha,scope=image-size
+          cache-to: type=gha,mode=max,scope=image-size
+
+      - name: Image-size gate (NFR-003)
+        run: ./scripts/gate-image-size.sh
+
+      - name: Upload gate logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-size-gate-logs
+          path: .tmp/current/gates/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  latency:
+    name: p95 API latency < 100ms (NFR-002)
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache: true
+          cache-dependency-path: server/go.sum
+
+      - name: p95 API latency gate (NFR-002/SC-003)
+        run:../scripts/gate-latency.sh
+
+      - name: Upload gate logs and JSON result
+
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: latency-gate-logs
+          path: .tmp/current/gates/
+          if-no-files-found: ignore
+          retention-days: 7

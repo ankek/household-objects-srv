@@ -83,6 +83,10 @@ func UpdateWarranty(ctx context.Context, repo storage.WarrantyRepository, req Up
 	})
 }
 
+func ValidateWarrantyDates(startsOn, expiresOn string) error {
+	return validateWarrantyDates(startsOn, expiresOn)
+}
+
 func validateWarrantyDates(startsOn, expiresOn string) error {
 	for _, d := range []struct{ field, value string }{
 		{"StartsOn", startsOn},

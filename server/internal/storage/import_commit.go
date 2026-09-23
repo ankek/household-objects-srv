@@ -272,6 +272,14 @@ func (r importCommitRepository) commitUpdateRow(ctx context.Context, tx *sql.Tx,
 		if rows != 1 {
 			return fmt.Errorf("update item core fields: matched %d rows, want 1 (read version %d); concurrent modification during import commit", rows, current.Version)
 		}
+
+		after := Item{
+			Name: row.Proposed.Name, Description: row.Proposed.Description,
+			LocationID: nullString(row.Proposed.LocationID), Quantity: row.Proposed.Quantity,
+		}
+		if err := recordFieldVersionsTx(ctx, q, r.group, "item", row.ItemID, current.Version+1, now, diffItemFieldVersions(current, after)); err != nil {
+			return fmt.Errorf("field versions: %w", err)
+		}
 	}
 
 	if changed["labels"] {
@@ -509,7 +517,13 @@ func upsertWarranty(ctx context.Context, q *gen.Queries, group, itemID string, c
 		if rows != 1 {
 			return fmt.Errorf("update: matched %d rows, want 1 (read version %d); concurrent modification during import commit", rows, current.Version)
 		}
-		return nil
+
+		after := Warranty{
+			Holder: proposed.Holder, Provider: proposed.Provider,
+			StartsOn: nullString(proposed.StartsOn), ExpiresOn: nullString(proposed.ExpiresOn),
+			IsLifetime: boolToInt(proposed.IsLifetime), Notes: proposed.Notes,
+		}
+		return recordFieldVersionsTx(ctx, q, group, "warranty_block", current.ID, current.Version+1, now, diffWarrantyFieldVersions(*current, after))
 	}
 }
 
@@ -550,7 +564,12 @@ func upsertPurchase(ctx context.Context, q *gen.Queries, group, itemID string, c
 		if rows != 1 {
 			return fmt.Errorf("update: matched %d rows, want 1 (read version %d); concurrent modification during import commit", rows, current.Version)
 		}
-		return nil
+
+		after := Purchase{
+			Vendor: proposed.Vendor, PurchasedOn: nullString(proposed.PurchasedOn),
+			PurchasePriceMinor: proposed.PurchasePriceMinor, OrderReference: proposed.OrderReference, Notes: proposed.Notes,
+		}
+		return recordFieldVersionsTx(ctx, q, group, "purchased_from_block", current.ID, current.Version+1, now, diffPurchaseFieldVersions(*current, after))
 	}
 }
 
@@ -591,7 +610,12 @@ func upsertSale(ctx context.Context, q *gen.Queries, group, itemID string, curre
 		if rows != 1 {
 			return fmt.Errorf("update: matched %d rows, want 1 (read version %d); concurrent modification during import commit", rows, current.Version)
 		}
-		return nil
+
+		after := Sale{
+			BuyerName: proposed.BuyerName, SoldOn: nullString(proposed.SoldOn),
+			SalePriceMinor: proposed.SalePriceMinor, Notes: proposed.Notes,
+		}
+		return recordFieldVersionsTx(ctx, q, group, "sold_to_block", current.ID, current.Version+1, now, diffSaleFieldVersions(*current, after))
 	}
 }
 
