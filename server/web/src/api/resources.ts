@@ -3,16 +3,25 @@ import type {
   Attachment,
   AttachmentCategory,
   AttachmentListResponse,
+  CustomFieldDef,
+  CustomFieldDefCreateRequest,
   CustomFieldDefListResponse,
+  CustomFieldDefUpdateRequest,
   CustomFieldType,
   DeviceTokenListResponse,
   GroupMembersResponse,
   GroupVisibility,
+  GroupVisibilityUpdateRequest,
   Identification,
   IdentificationKind,
   IdentificationListResponse,
+  ImportCommitResponse,
+  ImportPreviewResponse,
+  ImportUploadResponse,
   InviteCreateResponse,
   InviteListResponse,
+  InviteRedeemRequest,
+  InviteRedeemResponse,
   Item,
   ItemCustomField,
   ItemCustomFieldListResponse,
@@ -54,8 +63,8 @@ export function logout(): Promise<void> {
   return apiFetch<void>('/auth/logout', { method: 'POST' })
 }
 
-export function probeSession(): Promise<{ readonly sessions: readonly unknown[] }> {
-  return apiFetch('/auth/sessions')
+export function getCurrentUser(): Promise<LoginResponse> {
+  return apiFetch<LoginResponse>('/auth/me')
 }
 
 export interface ItemQuery {
@@ -410,6 +419,31 @@ export function listCustomFieldDefs(): Promise<CustomFieldDefListResponse> {
   return apiFetch<CustomFieldDefListResponse>('/custom-field-defs')
 }
 
+export function createCustomFieldDef(body: CustomFieldDefCreateRequest): Promise<CustomFieldDef> {
+  return apiFetch<CustomFieldDef>('/custom-field-defs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+export function updateCustomFieldDef(
+  fieldDefID: string,
+  body: CustomFieldDefUpdateRequest,
+): Promise<CustomFieldDef> {
+  return apiFetch<CustomFieldDef>(`/custom-field-defs/${encodeURIComponent(fieldDefID)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+export function deleteCustomFieldDef(fieldDefID: string): Promise<void> {
+  return apiFetch<void>(`/custom-field-defs/${encodeURIComponent(fieldDefID)}`, {
+    method: 'DELETE',
+  })
+}
+
 export function listItemAttachments(itemID: string): Promise<AttachmentListResponse> {
   return apiFetch<AttachmentListResponse>(`/items/${encodeURIComponent(itemID)}/attachments`)
 }
@@ -447,6 +481,16 @@ export function getGroupDetailVisibility(): Promise<GroupVisibility> {
   return apiFetch<GroupVisibility>('/groups/detail-visibility')
 }
 
+export function updateGroupDetailVisibility(
+  body: GroupVisibilityUpdateRequest,
+): Promise<GroupVisibility> {
+  return apiFetch<GroupVisibility>('/groups/detail-visibility', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
 export function listGroupMembers(): Promise<GroupMembersResponse> {
   return apiFetch<GroupMembersResponse>('/groups/members')
 }
@@ -479,6 +523,14 @@ export function createInvite(): Promise<InviteCreateResponse> {
 
 export function revokeInvite(inviteID: string): Promise<void> {
   return apiFetch<void>(`/invites/${encodeURIComponent(inviteID)}`, { method: 'DELETE' })
+}
+
+export function redeemInvite(request: InviteRedeemRequest): Promise<InviteRedeemResponse> {
+  return apiFetch<InviteRedeemResponse>('/invites/redeem', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+  })
 }
 
 export type ReportGroupBy = 'location' | 'label'
@@ -534,4 +586,22 @@ export function exportBomCSVURL(selection: BomSelection): string {
   for (const id of selection.itemIds ?? []) params.append('item_id', id)
   const query = params.toString()
   return `${API_BASE_URL}/export/bom${query ? `?${query}` : ''}`
+}
+
+export function importNativeUpload(csv: string): Promise<ImportUploadResponse> {
+  return apiFetch<ImportUploadResponse>('/import/native/upload', {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/csv' },
+    body: csv,
+  })
+}
+
+export function getImportPreview(importID: string): Promise<ImportPreviewResponse> {
+  return apiFetch<ImportPreviewResponse>(`/import/${encodeURIComponent(importID)}/preview`)
+}
+
+export function postImportCommit(importID: string): Promise<ImportCommitResponse> {
+  return apiFetch<ImportCommitResponse>(`/import/${encodeURIComponent(importID)}/commit`, {
+    method: 'POST',
+  })
 }

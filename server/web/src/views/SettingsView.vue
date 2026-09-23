@@ -1,9 +1,13 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import {
   API_BASE_URL,
   ApiError,
+  createCustomFieldDef,
   createInvite,
+  deleteCustomFieldDef,
+  getGroupDetailVisibility,
+  listCustomFieldDefs,
   listDeviceTokens,
   listGroupMembers,
   listInvites,
@@ -11,10 +15,15 @@ import {
   revokeDeviceToken,
   revokeInvite,
   revokeSession,
+  updateCustomFieldDef,
+  updateGroupDetailVisibility,
 } from '@/api'
 import type {
+  CustomFieldDef,
+  CustomFieldType,
   DeviceTokenListItem,
   GroupMemberListItem,
+  GroupVisibility,
   InviteListItem,
   SessionListItem,
 } from '@/api'
@@ -165,6 +174,22 @@ async function copyInviteToken(): Promise<void> {
   }
 }
 
+const justCreatedJoinLink = computed(() =>
+  justCreated.value
+    ? `${window.location.origin}/join?token=${encodeURIComponent(justCreated.value.token)}`
+    : '',
+)
+
+async function copyInviteJoinLink(): Promise<void> {
+  const link = justCreatedJoinLink.value
+  if (!link) return
+  try {
+    await navigator.clipboard.writeText(link)
+  } catch {
+    // See copyInviteToken's identical rationale.
+  }
+}
+
 async function doRevokeInvite(row: InviteListItem): Promise<void> {
   if (!window.confirm('Revoke this invite? It can no longer be redeemed.')) return
   revokingInviteId.value = row.id
@@ -179,11 +204,172 @@ async function doRevokeInvite(row: InviteListItem): Promise<void> {
   }
 }
 
+const visibility = ref<GroupVisibility | null>(null)
+const visibilityLoading = ref(true)
+const visibilityError = ref('')
+const visibilitySaving = ref(false)
+const warrantyVisible = ref(false)
+const saleVisible = ref(false)
+const purchaseVisible = ref(false)
+
+async function loadVisibility(): Promise<void> {
+  if (!session.isOwner) return
+  visibilityLoading.value = true
+  visibilityError.value = ''
+  try {
+    const state = await getGroupDetailVisibility()
+    visibility.value = state
+    warrantyVisible.value = state.warranty_visible
+    saleVisible.value = state.sale_visible
+    purchaseVisible.value = state.purchase_visible
+  } catch (err) {
+    visibilityError.value = describe(err)
+  } finally {
+    visibilityLoading.value = false
+  }
+}
+
+async function saveVisibility(): Promise<void> {
+  if (visibility.value?.version === undefined) return
+  visibilitySaving.value = true
+  visibilityError.value = ''
+  try {
+    const updated = await updateGroupDetailVisibility({
+      warranty_visible: warrantyVisible.value,
+      sale_visible: saleVisible.value,
+      purchase_visible: purchaseVisible.value,
+      version: visibility.value.version,
+    })
+    visibility.value = updated
+    warrantyVisible.value = updated.warranty_visible
+    saleVisible.value = updated.sale_visible
+    purchaseVisible.value = updated.purchase_visible
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 409) {
+      await loadVisibility()
+      visibilityError.value =
+        'Someone else changed these settings first. Reloading the current values.'
+    } else {
+      visibilityError.value = describe(err)
+    }
+  } finally {
+    visibilitySaving.value = false
+  }
+}
+
+const FIELD_TYPES: CustomFieldType[] = ['text', 'number', 'boolean', 'date']
+
+const fieldDefs = ref<CustomFieldDef[]>([])
+const fieldDefsLoading = ref(true)
+const fieldDefsError = ref('')
+const fieldDefsBusy = ref(false)
+
+const newFieldDefName = ref('')
+const newFieldDefType = ref<CustomFieldType>('text')
+
+const editingFieldDefId = ref<string | null>(null)
+const editFieldDefName = ref('')
+const editFieldDefType = ref<CustomFieldType>('text')
+
+async function loadFieldDefs(): Promise<void> {
+  if (!session.isOwner) return
+  fieldDefsLoading.value = true
+  fieldDefsError.value = ''
+  try {
+    fieldDefs.value = [...(await listCustomFieldDefs()).custom_field_defs]
+  } catch (err) {
+    fieldDefsError.value = describe(err)
+  } finally {
+    fieldDefsLoading.value = false
+  }
+}
+
+async function doCreateFieldDef(): Promise<void> {
+  const name = newFieldDefName.value.trim()
+  if (!name) return
+  fieldDefsBusy.value = true
+  fieldDefsError.value = ''
+  try {
+    const created = await createCustomFieldDef({
+      name,
+      field_type: newFieldDefType.value,
+      display_order: fieldDefs.value.length,
+    })
+    fieldDefs.value = [...fieldDefs.value, created]
+    newFieldDefName.value = ''
+    newFieldDefType.value = 'text'
+  } catch (err) {
+    fieldDefsError.value = describe(err)
+  } finally {
+    fieldDefsBusy.value = false
+  }
+}
+
+function startRenameFieldDef(row: CustomFieldDef): void {
+  editingFieldDefId.value = row.id
+  editFieldDefName.value = row.name
+  editFieldDefType.value = row.field_type
+  fieldDefsError.value = ''
+}
+
+function cancelRenameFieldDef(): void {
+  editingFieldDefId.value = null
+}
+
+async function doRenameFieldDef(): Promise<void> {
+  const row = fieldDefs.value.find((d) => d.id === editingFieldDefId.value)
+  const name = editFieldDefName.value.trim()
+  if (row === undefined || !name) return
+  fieldDefsBusy.value = true
+  fieldDefsError.value = ''
+  try {
+    const updated = await updateCustomFieldDef(row.id, {
+      name,
+      field_type: editFieldDefType.value,
+      display_order: row.display_order,
+      version: row.version,
+    })
+    fieldDefs.value = fieldDefs.value.map((d) => (d.id === updated.id ? updated : d))
+    editingFieldDefId.value = null
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 409) {
+      fieldDefsError.value = 'Someone else changed this definition first. Reload and try again.'
+    } else {
+      fieldDefsError.value = describe(err)
+    }
+  } finally {
+    fieldDefsBusy.value = false
+  }
+}
+
+async function doDeleteFieldDef(row: CustomFieldDef): Promise<void> {
+  if (
+    !window.confirm(
+      `Delete the "${row.name}" field definition? Items that already have a value for it keep ` +
+        'that value, but it will no longer appear as a choice when adding a new custom field.',
+    )
+  ) {
+    return
+  }
+  fieldDefsBusy.value = true
+  fieldDefsError.value = ''
+  try {
+    await deleteCustomFieldDef(row.id)
+    fieldDefs.value = fieldDefs.value.filter((d) => d.id !== row.id)
+  } catch (err) {
+    fieldDefsError.value = describe(err)
+  } finally {
+    fieldDefsBusy.value = false
+  }
+}
+
 onMounted(() => {
   void loadMembers()
   void loadSessions()
   void loadDeviceTokens()
   void loadInvites()
+  void loadVisibility()
+  void loadFieldDefs()
 })
 </script>
 
@@ -230,6 +416,13 @@ onMounted(() => {
             Dismiss
           </button>
         </div>
+        <p class="muted">Or send this link — it fills the token in for them:</p>
+        <code class="settings__invite-code">{{ justCreatedJoinLink }}</code>
+        <div class="h-stack">
+          <button class="btn btn--small" type="button" @click="copyInviteJoinLink">
+            Copy link
+          </button>
+        </div>
         <p class="muted settings__invite-expiry">
           Expires {{ formatDate(justCreated.expiresAt) }}.
         </p>
@@ -271,6 +464,119 @@ onMounted(() => {
           </button>
         </li>
       </ul>
+    </section>
+
+    <section v-if="session.isOwner" class="card v-stack settings__section">
+      <h2 class="settings__section-title">Item detail blocks</h2>
+      <p class="muted">
+        Choose which optional detail blocks appear on every item's page for the whole household. A
+        fresh household starts with all three hidden.
+      </p>
+
+      <p v-if="visibilityError" class="alert" role="alert">{{ visibilityError }}</p>
+      <p v-if="visibilityLoading" class="muted">Loading…</p>
+      <form v-else class="v-stack" @submit.prevent="saveVisibility">
+        <label class="h-stack settings__toggle">
+          <input v-model="warrantyVisible" type="checkbox" :disabled="visibilitySaving" />
+          Warranty
+        </label>
+        <label class="h-stack settings__toggle">
+          <input v-model="purchaseVisible" type="checkbox" :disabled="visibilitySaving" />
+          Purchase
+        </label>
+        <label class="h-stack settings__toggle">
+          <input v-model="saleVisible" type="checkbox" :disabled="visibilitySaving" />
+          Sale
+        </label>
+        <button
+          class="btn btn--primary btn--small settings__visibility-save"
+          type="submit"
+          :disabled="visibilitySaving"
+        >
+          {{ visibilitySaving ? 'Saving…' : 'Save' }}
+        </button>
+      </form>
+    </section>
+
+    <section v-if="session.isOwner" class="card v-stack settings__section">
+      <h2 class="settings__section-title">Custom fields</h2>
+      <p class="muted">
+        Field definitions standardize the custom fields available when entering an item's data.
+        Deleting one does not remove its value from items that already have it — only from the list
+        offered when adding a new custom field.
+      </p>
+
+      <p v-if="fieldDefsError" class="alert" role="alert">{{ fieldDefsError }}</p>
+      <p v-if="fieldDefsLoading" class="muted">Loading…</p>
+      <p v-else-if="fieldDefs.length === 0" class="empty">No custom field definitions yet.</p>
+      <ul v-else class="settings__list">
+        <li v-for="def in fieldDefs" :key="def.id" class="settings__row">
+          <template v-if="editingFieldDefId === def.id">
+            <form class="h-stack" @submit.prevent="doRenameFieldDef">
+              <input
+                v-model="editFieldDefName"
+                class="input"
+                :disabled="fieldDefsBusy"
+                aria-label="Name"
+              />
+              <select v-model="editFieldDefType" class="select" :disabled="fieldDefsBusy">
+                <option v-for="type in FIELD_TYPES" :key="type" :value="type">{{ type }}</option>
+              </select>
+              <button class="btn btn--primary btn--small" type="submit" :disabled="fieldDefsBusy">
+                Save
+              </button>
+              <button
+                class="btn btn--small"
+                type="button"
+                :disabled="fieldDefsBusy"
+                @click="cancelRenameFieldDef"
+              >
+                Cancel
+              </button>
+            </form>
+          </template>
+          <template v-else>
+            <div class="v-stack settings__row-info">
+              <span>{{ def.name }}</span>
+              <span class="muted settings__row-meta">{{ def.field_type }}</span>
+            </div>
+            <div class="h-stack">
+              <button
+                class="btn btn--ghost btn--small"
+                type="button"
+                :disabled="fieldDefsBusy"
+                @click="startRenameFieldDef(def)"
+              >
+                Rename
+              </button>
+              <button
+                class="btn btn--ghost btn--small btn--danger"
+                type="button"
+                :disabled="fieldDefsBusy"
+                @click="doDeleteFieldDef(def)"
+              >
+                Delete
+              </button>
+            </div>
+          </template>
+        </li>
+      </ul>
+
+      <form class="h-stack settings__field-def-create" @submit.prevent="doCreateFieldDef">
+        <input
+          v-model="newFieldDefName"
+          class="input"
+          placeholder="Field name"
+          :disabled="fieldDefsBusy"
+          aria-label="New field name"
+        />
+        <select v-model="newFieldDefType" class="select" :disabled="fieldDefsBusy">
+          <option v-for="type in FIELD_TYPES" :key="type" :value="type">{{ type }}</option>
+        </select>
+        <button class="btn btn--primary btn--small" type="submit" :disabled="fieldDefsBusy">
+          Add
+        </button>
+      </form>
     </section>
 
     <section class="card v-stack settings__section">
@@ -432,5 +738,19 @@ onMounted(() => {
 
 .settings__invite-create {
   align-self: flex-start;
+}
+
+.settings__toggle {
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.settings__visibility-save {
+  align-self: flex-start;
+}
+
+.settings__field-def-create {
+  align-items: center;
+  gap: 0.5rem;
 }
 </style>

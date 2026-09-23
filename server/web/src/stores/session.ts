@@ -2,9 +2,9 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import {
   ApiError,
+  getCurrentUser,
   login as loginRequest,
   logout as logoutRequest,
-  probeSession,
   register as registerRequest,
 } from '@/api'
 import type { LoginResponse } from '@/api'
@@ -22,7 +22,7 @@ export const useSessionStore = defineStore('session', () => {
   async function boot(): Promise<void> {
     if (status.value !== 'unknown') return
     try {
-      await probeSession()
+      user.value = await getCurrentUser()
       status.value = 'authenticated'
     } catch {
       status.value = 'anonymous'

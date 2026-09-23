@@ -20,6 +20,8 @@ async function signOut(): Promise<void> {
       <RouterLink to="/locations">Locations</RouterLink>
       <RouterLink to="/labels">Labels</RouterLink>
       <RouterLink to="/print-labels">Print labels</RouterLink>
+      <RouterLink to="/import">Import</RouterLink>
+      <RouterLink to="/reports">Reports</RouterLink>
       <RouterLink to="/settings">Settings</RouterLink>
     </nav>
 

@@ -119,6 +119,65 @@ describe('ReportsView tabs', () => {
   })
 })
 
+describe('ReportsView error and empty states', () => {
+  it('shows an alert on the Valuation tab when its report fails to load on mount', async () => {
+    const { wrapper } = await mountReports(
+      baseRoutes({
+        [VALUATION_LOCATION]: () => jsonResponse(500, { title: 'Internal Server Error' }),
+      }),
+    )
+
+    expect(wrapper.get('.alert').text()).toContain('Internal Server Error')
+    expect(wrapper.find('.reports__table').exists()).toBe(false)
+  })
+
+  it('renders the empty-state message on the Valuation tab when there are no rows', async () => {
+    const { wrapper } = await mountReports(baseRoutes())
+
+    expect(wrapper.text()).toContain('No data for this report yet.')
+    expect(wrapper.find('.reports__table').exists()).toBe(false)
+  })
+
+  it('shows an alert (and no crash) when running the Purchases report fails', async () => {
+    const { wrapper } = await mountReports(
+      baseRoutes({
+        'GET /api/v1/reports/purchases?from=2026-01-01&to=2026-12-31': () =>
+          jsonResponse(500, { title: 'Internal Server Error' }),
+      }),
+    )
+    await selectTab(wrapper, 'Purchases')
+
+    await wrapper.get('#purchases-from').setValue('2026-01-01')
+    await wrapper.get('#purchases-to').setValue('2026-12-31')
+    await wrapper.find('form').trigger('submit')
+    await flush()
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.get('.alert').text()).toContain('Internal Server Error')
+    expect(wrapper.find('.reports__table').exists()).toBe(false)
+  })
+
+  it('renders the empty-state message on Purchases only after Run comes back with no matches', async () => {
+    const { wrapper } = await mountReports(
+      baseRoutes({
+        'GET /api/v1/reports/purchases?from=2026-01-01&to=2026-12-31': () =>
+          jsonResponse(200, { rows: [] }),
+      }),
+    )
+    await selectTab(wrapper, 'Purchases')
+
+    expect(wrapper.text()).not.toContain('Nothing purchased in this range.')
+
+    await wrapper.get('#purchases-from').setValue('2026-01-01')
+    await wrapper.get('#purchases-to').setValue('2026-12-31')
+    await wrapper.find('form').trigger('submit')
+    await flush()
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.text()).toContain('Nothing purchased in this range.')
+  })
+})
+
 describe('ReportsView valuation (FR-060)', () => {
   it('renders the Unassigned bucket for an empty group_key, in location mode, without crashing', async () => {
     const { wrapper } = await mountReports(
