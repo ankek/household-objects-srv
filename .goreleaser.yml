@@ -10,7 +10,6 @@ before:
 builds:
   - id: hho
     binary: hho
-    # `go build ... ./cmd/hho`.
     dir: server
     main: ./cmd/hho
     env:
@@ -21,22 +20,14 @@ builds:
       - -s -w -X main.version={{ .Version }}
     goos:
       - linux
-      # - darwin
-      # - windows
     goarch:
       - amd64
       - arm64
-    ignore:
-      - goos: windows
-        goarch: arm64
 
 archives:
   - id: hho
     ids: [hho]
     formats: [tar.gz]
-    format_overrides:
-      - goos: windows
-        formats: [zip]
     name_template: >-
       hho_{{ .Version }}_{{ .Os }}_{{ .Arch }}
     files:
@@ -50,9 +41,4 @@ changelog:
   disable: true
 
 release:
-  github:
-    owner: ankek
-    name: Household-Objects-Dev
   name_template: "v{{ .Version }}"
-  footer: |
-    See [CHANGELOG.md](https://github.com/ankek/Household-Objects-Dev/blob/main/CHANGELOG.md) for the full release notes.

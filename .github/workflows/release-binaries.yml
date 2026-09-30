@@ -58,4 +58,4 @@ jobs:
         if: always()
         run: |
           echo "### Published raw binaries for tag \`${{ github.ref_name }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, windows/amd64 -- see the release's assets and \`checksums.txt\`." >> "$GITHUB_STEP_SUMMARY"
+          echo "linux/amd64, linux/arm64 -- see the release's assets and \`checksums.txt\`." >> "$GITHUB_STEP_SUMMARY"

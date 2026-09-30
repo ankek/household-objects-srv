@@ -2,7 +2,7 @@ module github.com/ankek/Household-Objects-Dev/server
 
 go 1.25.7
 
-toolchain go1.25.13
+toolchain go1.26.8
 
 require (
 	github.com/boombuler/barcode v1.1.0
