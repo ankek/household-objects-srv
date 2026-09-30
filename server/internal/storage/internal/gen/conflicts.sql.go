@@ -49,3 +49,79 @@ func (q *Queries) CreateConflict(ctx context.Context, arg CreateConflictParams) 
 	)
 	return err
 }
+
+const listConflictsPage = `-- name: ListConflictsPage :many
+SELECT
+    c.id,
+    m.mutation_id AS wire_mutation_id,
+    c.entity_type,
+    c.entity_id,
+    c.field_name,
+    c.server_value_snapshot,
+    c.losing_client_value_snapshot,
+    c.detected_at
+FROM conflicts c
+LEFT JOIN mutations m
+    ON m.id = c.mutation_id
+   AND m.group_id = c.group_id
+   AND m.group_id = ?1
+WHERE c.group_id = ?1
+  AND (c.detected_at, c.id) < (CAST(?2 AS INTEGER), CAST(?3 AS TEXT))
+ORDER BY c.detected_at DESC, c.id DESC
+LIMIT ?4
+`
+
+type ListConflictsPageParams struct {
+	GroupID         string
+	AfterDetectedAt int64
+	AfterID         string
+	PageLimit       int64
+}
+
+type ListConflictsPageRow struct {
+	ID                        string
+	WireMutationID            sql.NullString
+	EntityType                string
+	EntityID                  string
+	FieldName                 string
+	ServerValueSnapshot       sql.NullString
+	LosingClientValueSnapshot sql.NullString
+	DetectedAt                int64
+}
+
+func (q *Queries) ListConflictsPage(ctx context.Context, arg ListConflictsPageParams) ([]ListConflictsPageRow, error) {
+	rows, err := q.db.QueryContext(ctx, listConflictsPage,
+		arg.GroupID,
+		arg.AfterDetectedAt,
+		arg.AfterID,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListConflictsPageRow{}
+	for rows.Next() {
+		var i ListConflictsPageRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.WireMutationID,
+			&i.EntityType,
+			&i.EntityID,
+			&i.FieldName,
+			&i.ServerValueSnapshot,
+			&i.LosingClientValueSnapshot,
+			&i.DetectedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
