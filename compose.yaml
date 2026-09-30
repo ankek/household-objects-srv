@@ -12,8 +12,9 @@ services:
       - '${HHO_PORT:-7745}:7745'
 
     volumes:
+      - hho-data:/data
+      # To use a host directory instead:
       #   mkdir -p ./data && sudo chown -R 65532:65532 ./data
-      #
       # - ./data:/data
 
     environment:
