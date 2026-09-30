@@ -3,9 +3,13 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"github.com/ankek/Household-Objects-Dev/server/internal/storage/internal/gen"
+	"math"
+	"strconv"
+	"strings"
 )
 
 type MutationLedgerEntry = gen.Mutation
@@ -124,6 +128,55 @@ type PushRepository interface {
 	UpsertFieldVersion(ctx context.Context, p UpsertFieldVersionParams) error
 
 	InsertConflict(ctx context.Context, p InsertConflictParams) (ConflictRecord, error)
+
+	ListConflicts(ctx context.Context, after *ConflictCursor, limit int) (ConflictPage, error)
+}
+
+const MaxConflictPageLimit = 200
+
+var ErrInvalidConflictPage = errors.New("storage: conflict page limit is out of range")
+
+var ErrInvalidConflictCursor = errors.New("storage: malformed conflict cursor")
+
+type ConflictLogEntry struct {
+	ID                string
+	MutationID        *string
+	EntityType        string
+	EntityID          string
+	FieldName         string
+	ServerValue       *string
+	LosingClientValue *string
+	DetectedAt        int64
+}
+
+type ConflictCursor struct {
+	DetectedAt int64
+	ID         string
+}
+
+type ConflictPage struct {
+	Entries []ConflictLogEntry
+	Next    *ConflictCursor
+}
+
+func EncodeConflictCursor(c ConflictCursor) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(strconv.FormatInt(c.DetectedAt, 10) + ":" + c.ID))
+}
+
+func DecodeConflictCursor(s string) (ConflictCursor, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return ConflictCursor{}, ErrInvalidConflictCursor
+	}
+	ts, id, ok := strings.Cut(string(raw), ":")
+	if !ok || id == "" {
+		return ConflictCursor{}, ErrInvalidConflictCursor
+	}
+	n, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil {
+		return ConflictCursor{}, ErrInvalidConflictCursor
+	}
+	return ConflictCursor{DetectedAt: n, ID: id}, nil
 }
 
 type pushRepository struct {
@@ -185,6 +238,49 @@ func (r pushRepository) InsertConflict(ctx context.Context, p InsertConflictPara
 		return ConflictRecord{}, err
 	}
 	return created, nil
+}
+
+func (r pushRepository) ListConflicts(ctx context.Context, after *ConflictCursor, limit int) (ConflictPage, error) {
+	if limit < 1 || limit > MaxConflictPageLimit {
+		return ConflictPage{}, fmt.Errorf("%w: %d", ErrInvalidConflictPage, limit)
+	}
+	afterAt, afterID := int64(math.MaxInt64), ""
+	if after != nil {
+		afterAt, afterID = after.DetectedAt, after.ID
+	}
+	rows, err := r.queries().ListConflictsPage(ctx, gen.ListConflictsPageParams{
+		GroupID: r.group(), AfterDetectedAt: afterAt, AfterID: afterID, PageLimit: int64(limit) + 1,
+	})
+	if err != nil {
+		return ConflictPage{}, fmt.Errorf("storage: list conflicts: %w", err)
+	}
+	page := ConflictPage{Entries: make([]ConflictLogEntry, 0, min(len(rows), limit))}
+	for i, row := range rows {
+		if i == limit {
+			last := page.Entries[limit-1]
+			page.Next = &ConflictCursor{DetectedAt: last.DetectedAt, ID: last.ID}
+			break
+		}
+		page.Entries = append(page.Entries, ConflictLogEntry{
+			ID:                row.ID,
+			MutationID:        stringPtrOrNil(row.WireMutationID),
+			EntityType:        row.EntityType,
+			EntityID:          row.EntityID,
+			FieldName:         row.FieldName,
+			ServerValue:       stringPtrOrNil(row.ServerValueSnapshot),
+			LosingClientValue: stringPtrOrNil(row.LosingClientValueSnapshot),
+			DetectedAt:        row.DetectedAt,
+		})
+	}
+	return page, nil
+}
+
+func stringPtrOrNil(n sql.NullString) *string {
+	if !n.Valid {
+		return nil
+	}
+	v := n.String
+	return &v
 }
 
 func lookupMutationLedgerEntryTx(ctx context.Context, q *gen.Queries, group, mutationID string) (MutationLedgerEntry, error) {
